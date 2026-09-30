@@ -63,6 +63,23 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._init_tray()
 
+        self._enabled = {"CPU": enable_cpu, "MEMORY": enable_memory, "GPU": enable_gpu}
+        self.cores_card = None
+        self.core_grid = CoreGrid()
+
+        self._build_ui()
+        self._start_sampler(interval, enable_cpu, enable_memory, enable_gpu, enable_thermal)
+
+        self._anim = QtCore.QTimer(self)
+        self._anim.setInterval(16)
+        self._anim.timeout.connect(self._on_anim)
+        self._anim.start()
+
+        self._clock = QtCore.QTimer(self)
+        self._clock.setInterval(1000)
+        self._clock.timeout.connect(self._refresh_clock)
+        self._clock.start()
+
     def _init_tray(self) -> None:
         if not QtWidgets.QSystemTrayIcon.isSystemTrayAvailable():
             self.tray_icon = None
@@ -120,22 +137,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.hide()
             else:
                 self._show_from_tray()
-        self._enabled = {"CPU": enable_cpu, "MEMORY": enable_memory, "GPU": enable_gpu}
-        self.cores_card = None
-        self.core_grid = CoreGrid()
-
-        self._build_ui()
-        self._start_sampler(interval, enable_cpu, enable_memory, enable_gpu, enable_thermal)
-
-        self._anim = QtCore.QTimer(self)
-        self._anim.setInterval(16)
-        self._anim.timeout.connect(self._on_anim)
-        self._anim.start()
-
-        self._clock = QtCore.QTimer(self)
-        self._clock.setInterval(1000)
-        self._clock.timeout.connect(self._refresh_clock)
-        self._clock.start()
 
     # ------------------------------------------------------------------ ui
 
