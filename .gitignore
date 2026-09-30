@@ -19,3 +19,4 @@ sysmon/sensors/*.dll
 .idea/
 Thumbs.db
 desktop.ini
+*.lnk

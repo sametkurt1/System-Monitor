@@ -207,7 +207,7 @@ def start_thermal_worker_elevated(parent_pid: int) -> Tuple[bool, str]:
 
         SW_HIDE = 0
         repo_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-        gui_script = os.path.join(repo_dir, "sysmon-gui.py")
+        gui_script = os.path.join(repo_dir, "sysmon.py")
 
         if getattr(sys, "frozen", False):
             lp_file = sys.executable
