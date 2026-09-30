@@ -193,7 +193,8 @@ def enable_privilege(priv_name: str) -> bool:
             advapi32.AdjustTokenPrivileges(
                 h_token, False, ctypes.byref(tp), ctypes.sizeof(tp), None, None
             )
-            return kernel32.GetLastError() == 0
+            err = kernel32.GetLastError()
+            return err in (0, 1300)
         finally:
             kernel32.CloseHandle(h_token)
     except Exception:
@@ -226,6 +227,7 @@ def clean_ram() -> CleanResult:
             needs_elevation=True,
         )
 
+    before_cache = get_cleanable_cache_bytes()
     before_avail = get_available_memory_bytes() or 0
 
     try:
@@ -275,8 +277,13 @@ def clean_ram() -> CleanResult:
                 f"NtSetSystemInformation failed with code 0x{status & 0xFFFFFFFF:08X}.",
             )
 
+        after_cache = get_cleanable_cache_bytes()
         after_avail = get_available_memory_bytes() or before_avail
-        freed = max(0, after_avail - before_avail)
+
+        if before_cache is not None and after_cache is not None:
+            freed = max(0, before_cache - after_cache)
+        else:
+            freed = max(0, after_avail - before_avail)
 
         if freed > 0:
             msg = f"RAM cache cleaned ({human_gb(freed)} freed)"
@@ -334,6 +341,7 @@ def clean_ram_with_elevation() -> CleanResult:
             )
             lp_params = f'-c "{code}"'
 
+        before_cache = get_cleanable_cache_bytes()
         before_avail = get_available_memory_bytes() or 0
 
         sei = SHELLEXECUTEINFOW()
@@ -364,8 +372,13 @@ def clean_ram_with_elevation() -> CleanResult:
             kernel32.CloseHandle(sei.hProcess)
             success = exit_code.value == 0
 
+        after_cache = get_cleanable_cache_bytes()
         after_avail = get_available_memory_bytes() or before_avail
-        freed = max(0, after_avail - before_avail)
+
+        if before_cache is not None and after_cache is not None:
+            freed = max(0, before_cache - after_cache)
+        else:
+            freed = max(0, after_avail - before_avail)
 
         if success:
             msg = f"RAM cache cleaned ({human_gb(freed)} freed)" if freed > 0 else "RAM standby cache cleared"
