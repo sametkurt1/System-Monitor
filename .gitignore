@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Build output
+build/
+dist/
+*.spec
+
+# Optional sensor provider (fetched by `sysmon sensors install`).
+# It ships a kernel driver; keeping it out of version control is deliberate.
+sysmon/sensors/*.dll
+
+# Editors / OS
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini

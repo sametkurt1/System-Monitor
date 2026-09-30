@@ -1,0 +1,4 @@
+# System Monitor dependencies
+PySide6-Essentials>=6.5
+pythonnet>=3.0
+pyinstaller>=6.0
