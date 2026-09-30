@@ -156,6 +156,10 @@ def enable_privilege(priv_name: str) -> bool:
         advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 
+        kernel32.GetCurrentProcess.restype = w.HANDLE
+        kernel32.CloseHandle.argtypes = [w.HANDLE]
+        kernel32.CloseHandle.restype = w.BOOL
+
         TOKEN_ADJUST_PRIVILEGES = 0x0020
         TOKEN_QUERY = 0x0008
         SE_PRIVILEGE_ENABLED = 0x00000002
@@ -171,6 +175,20 @@ def enable_privilege(priv_name: str) -> bool:
                 ("PrivilegeCount", w.DWORD),
                 ("Privileges", LUID_AND_ATTRIBUTES * 1),
             ]
+
+        advapi32.OpenProcessToken.argtypes = [w.HANDLE, w.DWORD, ctypes.POINTER(w.HANDLE)]
+        advapi32.OpenProcessToken.restype = w.BOOL
+        advapi32.LookupPrivilegeValueW.argtypes = [w.LPCWSTR, w.LPCWSTR, ctypes.POINTER(LUID)]
+        advapi32.LookupPrivilegeValueW.restype = w.BOOL
+        advapi32.AdjustTokenPrivileges.argtypes = [
+            w.HANDLE,
+            w.BOOL,
+            ctypes.POINTER(TOKEN_PRIVILEGES),
+            w.DWORD,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+        ]
+        advapi32.AdjustTokenPrivileges.restype = w.BOOL
 
         h_token = w.HANDLE()
         if not advapi32.OpenProcessToken(
@@ -219,7 +237,7 @@ def clean_ram() -> CleanResult:
     p_profile = enable_privilege("SeProfileSingleProcessPrivilege")
     enable_privilege("SeIncreaseQuotaPrivilege")
 
-    if not is_admin() and not p_profile:
+    if not is_admin():
         return CleanResult(
             False,
             0,
