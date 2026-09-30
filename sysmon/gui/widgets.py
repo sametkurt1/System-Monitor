@@ -662,3 +662,37 @@ def make_icon(size: int = 64) -> QtGui.QIcon:
     return QtGui.QIcon(pm)
 
 
+def make_tray_icon(usage_pct: Optional[float] = None, size: int = 32) -> QtGui.QIcon:
+    """System tray icon displaying current RAM percentage text (e.g. '60')."""
+    pm = QtGui.QPixmap(size, size)
+    pm.fill(QtCore.Qt.transparent)
+    p = QtGui.QPainter(pm)
+    p.setRenderHint(QtGui.QPainter.Antialiasing, True)
+    p.setRenderHint(QtGui.QPainter.TextAntialiasing, True)
+
+    # Background rounded container
+    bg_rect = QtCore.QRectF(1, 1, size - 2, size - 2)
+    p.setPen(T.pen(T.CARD_BORDER, 1.2))
+    p.setBrush(QtGui.QBrush(T.qcolor(T.BG)))
+    p.drawRoundedRect(bg_rect, 6, 6)
+
+    # Usage arc ring
+    if usage_pct is not None:
+        frac = max(0.0, min(100.0, usage_pct)) / 100.0
+        ring_box = bg_rect.adjusted(2, 2, -2, -2)
+        p.setPen(T.pen(T.MEM, 2.0, cap=QtCore.Qt.RoundCap))
+        p.drawArc(ring_box, 225 * 16, int(-270 * 16 * frac))
+
+        txt = f"{int(round(usage_pct))}"
+    else:
+        txt = "--"
+
+    # RAM percentage text
+    font = QtGui.QFont(T.NUM_FAMILY if hasattr(T, "NUM_FAMILY") else "Segoe UI", 11, QtGui.QFont.Weight.Bold)
+    p.setFont(font)
+    p.setPen(T.qcolor(T.FG_TITLE))
+    p.drawText(bg_rect, QtCore.Qt.AlignmentFlag.AlignCenter, txt)
+    p.end()
+    return QtGui.QIcon(pm)
+
+

@@ -19,7 +19,7 @@ from ..models import Snapshot
 from . import theme as T
 from .sampler import SamplerThread
 from .widgets import (BarGauge, Card, CoreGrid, ElidedLabel, Gauge, Sparkline,
-                      StatRow, make_icon)
+                      StatRow, make_icon, make_tray_icon)
 
 HISTORY = 120
 INTERVALS = (0.5, 1.0, 2.0, 5.0)
@@ -56,8 +56,70 @@ class MainWindow(QtWidgets.QMainWindow):
         self._last = Snapshot()
         self._paused = False
         self._top_most = False
+        self._minimize_to_tray = True
+        self._force_quit = False
         self._notes: List[str] = []
         self._show_cores = show_cores
+
+        self._init_tray()
+
+    def _init_tray(self) -> None:
+        if not QtWidgets.QSystemTrayIcon.isSystemTrayAvailable():
+            self.tray_icon = None
+            return
+
+        self.tray_icon = QtWidgets.QSystemTrayIcon(make_tray_icon(None), self)
+        self.tray_icon.setToolTip("sysmon — System Monitor")
+
+        tray_menu = QtWidgets.QMenu(self)
+        tray_menu.setStyleSheet(f"""
+            QMenu {{
+                background: {T.CARD};
+                border: 1px solid {T.CARD_BORDER};
+                color: {T.FG};
+                padding: 4px;
+            }}
+            QMenu::item {{
+                padding: 5px 20px;
+                border-radius: 4px;
+            }}
+            QMenu::item:selected {{
+                background: {T.alpha_css(T.qcolor(T.ACCENT, 40))};
+                color: {T.FG_TITLE};
+            }}
+        """)
+
+        show_act = tray_menu.addAction("Show Window")
+        show_act.triggered.connect(self._show_from_tray)
+
+        clean_act = tray_menu.addAction("Clean Standby Cache")
+        clean_act.triggered.connect(self._on_clean_ram)
+
+        tray_menu.addSeparator()
+
+        quit_act = tray_menu.addAction("Quit sysmon")
+        quit_act.triggered.connect(self._quit_from_tray)
+
+        self.tray_icon.setContextMenu(tray_menu)
+        self.tray_icon.activated.connect(self._on_tray_activated)
+        self.tray_icon.show()
+
+    def _show_from_tray(self) -> None:
+        self.showNormal()
+        self.activateWindow()
+        self.raise_()
+
+    def _quit_from_tray(self) -> None:
+        self._force_quit = True
+        self.close()
+
+    def _on_tray_activated(self, reason: QtWidgets.QSystemTrayIcon.ActivationReason) -> None:
+        if reason in (QtWidgets.QSystemTrayIcon.ActivationReason.Trigger,
+                      QtWidgets.QSystemTrayIcon.ActivationReason.DoubleClick):
+            if self.isVisible() and not self.isMinimized():
+                self.hide()
+            else:
+                self._show_from_tray()
         self._enabled = {"CPU": enable_cpu, "MEMORY": enable_memory, "GPU": enable_gpu}
         self.cores_card = None
         self.core_grid = CoreGrid()
@@ -164,6 +226,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.top_btn.setStyleSheet(self._button_qss())
         self.top_btn.toggled.connect(self._on_top)
         bar.addWidget(self.top_btn)
+
+        self.tray_btn = QtWidgets.QPushButton("Tray")
+        self.tray_btn.setCheckable(True)
+        self.tray_btn.setChecked(True)
+        self.tray_btn.setToolTip("Minimize to system tray when closing the window")
+        self.tray_btn.setCursor(QtCore.Qt.PointingHandCursor)
+        self.tray_btn.setFixedHeight(27)
+        self.tray_btn.setStyleSheet(self._button_qss())
+        self.tray_btn.toggled.connect(self._on_tray_toggle)
+        bar.addWidget(self.tray_btn)
 
         from ..cleaner import is_admin
         if not is_admin():
@@ -404,6 +476,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.show()  # re-apply the flag
         self.update()
 
+    def _on_tray_toggle(self, checked: bool) -> None:
+        self._minimize_to_tray = checked
+
     def _on_anim(self) -> None:
         for widget in (self.cpu_gauge, self.gpu_gauge, self.mem_bar, self.vram_bar):
             widget.tick()
@@ -493,11 +568,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self.mem_clean_btn.setText("⚡ Clean Standby Cache")
 
     def closeEvent(self, event) -> None:  # noqa: N802
+        if self._minimize_to_tray and not getattr(self, "_force_quit", False) and hasattr(self, "tray_icon") and self.tray_icon and self.tray_icon.isVisible():
+            event.ignore()
+            self.hide()
+            return
+
         if hasattr(self, "_clean_thread") and self._clean_thread.isRunning():
             self._clean_thread.wait(1000)
         self._anim.stop()
         self._clock.stop()
         self.sampler.stop()
+        if hasattr(self, "tray_icon") and self.tray_icon:
+            self.tray_icon.hide()
         super().closeEvent(event)
 
     # ------------------------------------------------------------ snapshot
@@ -607,6 +689,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.mem_card.set_badge(human_gb(mem.total_bytes, 0), T.FG_DIM)
         self.mem_used.set_value(human_gb(mem.used_bytes), T.qcolor(T.FG))
         self.mem_avail.set_value(human_gb(mem.available_bytes), T.qcolor(T.FG))
+
+        # Update System Tray Icon with RAM usage % text
+        if hasattr(self, "tray_icon") and self.tray_icon:
+            self.tray_icon.setIcon(make_tray_icon(mem.usage))
+            ram_pct_str = f"{int(round(mem.usage))}%" if mem.usage is not None else "N/A"
+            self.tray_icon.setToolTip(f"sysmon — RAM: {ram_pct_str} | Available: {human_gb(mem.available_bytes)}")
+
         if mem.committed_bytes and mem.commit_limit_bytes:
             # The card is narrow, so the percentage is the headline and the byte
             # counts live in the tooltip.
