@@ -352,7 +352,8 @@ def clean_ram_with_elevation() -> CleanResult:
             lp_file = sys.executable
             lp_params = "--clean-ram"
         else:
-            lp_file = sys.executable
+            pythonw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+            lp_file = pythonw if os.path.exists(pythonw) else sys.executable
             code = (
                 f"import sys; sys.path.insert(0, {repr(repo_dir)});"
                 "from sysmon.cleaner import clean_ram; sys.exit(0 if clean_ram().success else 1)"

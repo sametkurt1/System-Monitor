@@ -131,6 +131,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.close()
 
     def _on_tray_activated(self, reason: QtWidgets.QSystemTrayIcon.ActivationReason) -> None:
+        if reason == QtWidgets.QSystemTrayIcon.ActivationReason.MiddleClick:
+            self._on_clean_ram()
+            return
         if reason in (QtWidgets.QSystemTrayIcon.ActivationReason.Trigger,
                       QtWidgets.QSystemTrayIcon.ActivationReason.DoubleClick):
             if self.isVisible() and not self.isMinimized():
@@ -545,6 +548,13 @@ class MainWindow(QtWidgets.QMainWindow):
             self.clean_btn.setText(freed_str)
             self.mem_clean_btn.setText(f"✓ {freed_str}")
             self.status.setText(f"✓ {result.message}")
+            if hasattr(self, "tray_icon") and self.tray_icon and not self.isVisible():
+                self.tray_icon.showMessage(
+                    "sysmon — Standby Cache",
+                    result.message,
+                    QtWidgets.QSystemTrayIcon.MessageIcon.Information,
+                    2500,
+                )
             # Request immediate sample so gauges reflect freed memory
             self.sampler.set_interval(0.1)
             QtCore.QTimer.singleShot(1200, lambda: self.sampler.set_interval(self.interval_box.currentData()))
@@ -552,6 +562,13 @@ class MainWindow(QtWidgets.QMainWindow):
             self.clean_btn.setText("Clean RAM")
             self.mem_clean_btn.setText("⚡ Clean Standby Cache")
             self.status.setText(f"⚠️ {result.message}")
+            if hasattr(self, "tray_icon") and self.tray_icon and not self.isVisible():
+                self.tray_icon.showMessage(
+                    "sysmon — Standby Cache",
+                    result.message,
+                    QtWidgets.QSystemTrayIcon.MessageIcon.Warning,
+                    3000,
+                )
 
         QtCore.QTimer.singleShot(3000, self._reset_clean_buttons)
 
@@ -695,7 +712,11 @@ class MainWindow(QtWidgets.QMainWindow):
         if hasattr(self, "tray_icon") and self.tray_icon:
             self.tray_icon.setIcon(make_tray_icon(mem.usage))
             ram_pct_str = f"{int(round(mem.usage))}%" if mem.usage is not None else "N/A"
-            self.tray_icon.setToolTip(f"sysmon — RAM: {ram_pct_str} | Available: {human_gb(mem.available_bytes)}")
+            self.tray_icon.setToolTip(
+                f"sysmon — RAM: {ram_pct_str} | Avail: {human_gb(mem.available_bytes)}\n"
+                "• Sol tık: Pencereyi Göster / Gizle\n"
+                "• Orta tık (Scroll): Standby RAM Temizle"
+            )
 
         if mem.committed_bytes and mem.commit_limit_bytes:
             # The card is narrow, so the percentage is the headline and the byte

@@ -209,14 +209,17 @@ def start_thermal_worker_elevated(parent_pid: int) -> Tuple[bool, str]:
         repo_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
         gui_script = os.path.join(repo_dir, "sysmon.py")
 
+        pythonw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+        target_py = pythonw if os.path.exists(pythonw) else sys.executable
+
         if getattr(sys, "frozen", False):
             lp_file = sys.executable
             lp_params = f"--thermal-worker {parent_pid}"
         elif os.path.isfile(gui_script):
-            lp_file = sys.executable
+            lp_file = target_py
             lp_params = f'"{gui_script}" --thermal-worker {parent_pid}'
         else:
-            lp_file = sys.executable
+            lp_file = target_py
             code = (
                 f"import sys; sys.path.insert(0, {repr(repo_dir)});"
                 f"from sysmon.sensors.thermal import run_thermal_worker; run_thermal_worker({parent_pid})"

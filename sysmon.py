@@ -7,16 +7,34 @@ import sys
 # Ensure repository root is on sys.path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-# Hide console window immediately on Windows if launched standalone (e.g. double-clicked)
+# If launched on Windows under python.exe / py.exe (e.g. double-clicked in Explorer),
+# re-spawn detached under pythonw.exe so the terminal / py.exe console window closes immediately!
 if sys.platform == "win32" and not (len(sys.argv) >= 3 and sys.argv[1] == "--thermal-worker"):
+    if "--no-relaunch" in sys.argv:
+        sys.argv.remove("--no-relaunch")
+    elif not sys.executable.lower().endswith("pythonw.exe"):
+        pythonw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+        if not os.path.exists(pythonw):
+            pythonw = "pythonw.exe"
+        try:
+            import subprocess
+            DETACHED_PROCESS = 0x00000008
+            CREATE_NO_WINDOW = 0x08000000
+            subprocess.Popen(
+                [pythonw, os.path.abspath(__file__)] + sys.argv[1:],
+                creationflags=DETACHED_PROCESS | CREATE_NO_WINDOW,
+                close_fds=True,
+            )
+            sys.exit(0)
+        except Exception:
+            pass
+
+    # Fallback: hide console if already running in one
     try:
         import ctypes
         hwnd = ctypes.windll.kernel32.GetConsoleWindow()
         if hwnd:
-            pids = (ctypes.c_uint * 2)()
-            count = ctypes.windll.kernel32.GetConsoleProcessList(pids, 2)
-            if count <= 2:
-                ctypes.windll.user32.ShowWindow(hwnd, 0)
+            ctypes.windll.user32.ShowWindow(hwnd, 0)
     except Exception:
         pass
 

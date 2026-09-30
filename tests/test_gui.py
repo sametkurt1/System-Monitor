@@ -343,6 +343,17 @@ else:
             assert "2" in win.mem_cache._text or "GB" in win.mem_cache._text
             assert "2" in win.clean_btn.text()
             assert "2" in win.mem_clean_btn.text()
+
+            # 6. Middle click on tray icon triggers clean ram
+            called = []
+            orig_clean = win._on_clean_ram
+            win._on_clean_ram = lambda: called.append(True)
+            try:
+                from PySide6 import QtWidgets
+                win._on_tray_activated(QtWidgets.QSystemTrayIcon.ActivationReason.MiddleClick)
+                assert called == [True]
+            finally:
+                win._on_clean_ram = orig_clean
         finally:
             win.close()
         return "clean ram buttons and signal handlers ok"
