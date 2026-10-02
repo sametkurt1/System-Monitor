@@ -668,8 +668,176 @@ def test_gpu_provider_degrades_without_nvml():
         ctypes.WinDLL = original
 
 
+def test_fps_model():
+    from sysmon.models import FpsSnapshot, Snapshot
+    s = FpsSnapshot()
+    assert s.fps is None
+    assert not s.has_fps
+    assert not s.is_active
+
+    active = FpsSnapshot(fps=144.0, frametime_ms=6.94, fps_1percent_low=120.0,
+                         app_name="Cyberpunk2077.exe", pid=1234, is_active=True, is_available=True)
+    assert active.has_fps
+    assert active.fps == 144.0
+
+    snap = Snapshot(fps=active)
+    assert snap.fps.has_fps
+    return "fps model dataclass ok"
+
+
+def test_fps_tracker():
+    from sysmon.sensors.fps import FpsTracker
+    tracker = FpsTracker(window_seconds=1.0)
+    for _ in range(120):
+        tracker.add_frame("Game.exe", 4321, False, 8.33)
+    fps, ft, low, name, pid, active = tracker.compute_stats(4321)
+    assert fps is not None and fps > 100.0, f"Expected > 100 fps, got {fps}"
+    assert ft is not None and abs(ft - 8.33) < 0.1
+    assert low is not None and low > 90.0
+    assert name == "Game.exe"
+    assert pid == 4321
+    assert active is True
+    return f"tracker ok (fps={fps}, ft={ft}ms, 1%low={low})"
+
+
+def test_fps_tracker_uses_presentmon_timestamps():
+    """A burst of rows arriving at once must still produce the right rate."""
+    from sysmon.sensors.fps import FpsTracker
+    tracker = FpsTracker(window_seconds=1.0)
+    # 240 frames spaced 4.1666 ms apart = 240 fps.  All rows are fed inside one
+    # millisecond, so a wall-clock based tracker would see a zero-length window.
+    base = 1000.0
+    for i in range(240):
+        tracker.add_frame("Game.exe", 777, False, 4.1666, timestamp=base + i * 0.0041666)
+    fps, ft, low, name, pid, active = tracker.compute_stats(777)
+    assert active is True
+    assert fps is not None and 230.0 <= fps <= 250.0, f"expected ~240 fps, got {fps}"
+    assert ft is not None and abs(ft - 4.1666) < 0.05, ft
+    assert low is not None and low > 200.0, low
+    return f"timestamped tracker ok (fps={fps}, 1%low={low})"
+
+
+def test_fps_tracker_ignores_shell_and_browsers():
+    from sysmon.sensors.fps import FpsTracker
+    tracker = FpsTracker(window_seconds=1.0)
+    for pid, name in ((10, "dwm.exe"), (11, "explorer.exe"), (12, "chrome.exe")):
+        for i in range(60):
+            tracker.add_frame(name, pid, False, 16.6, timestamp=100.0 + i * 0.0166)
+    # The game is the foreground process, so it must win over all the shell noise.
+    for i in range(60):
+        tracker.add_frame("Cyberpunk2077.exe", 900, False, 10.0,
+                          timestamp=100.0 + i * 0.01)
+    fps, ft, low, name, pid, active = tracker.compute_stats(900)
+    assert active is True
+    assert name == "Cyberpunk2077.exe" and pid == 900, (name, pid)
+    assert fps is not None and 90.0 <= fps <= 110.0, fps
+
+    # With only shell processes on screen nothing is reported as "the game".
+    only_shell = FpsTracker(window_seconds=1.0)
+    for i in range(60):
+        only_shell.add_frame("chrome.exe", 12, False, 16.6, timestamp=100.0 + i * 0.0166)
+    fps2, ft2, low2, name2, pid2, active2 = only_shell.compute_stats(12)
+    assert active2 is False, "a browser must never be reported as in-game FPS"
+    return "shell/browsers filtered out of the FPS target"
+
+
+def test_fps_csv_reader_maps_columns_by_name():
+    """The column layout must come from the header, never from hard-coded offsets.
+
+    The old code read position 6 as the drop flag, which is ``AllowsTearing`` in
+    the 2.x metric set - so virtually every frame looked dropped and no FPS was
+    ever produced.
+    """
+    from sysmon.sensors.fps import PresentMonCsvReader
+
+    v2_header = ("Application,ProcessID,SwapChainAddress,PresentRuntime,SyncInterval,"
+                 "PresentFlags,AllowsTearing,PresentMode,WasBatched,DwmNotified,"
+                 "Dropped,TimeInSeconds,MsBetweenPresents")
+    reader = PresentMonCsvReader()
+    assert reader.feed(v2_header) is None
+    assert reader.ready, "header was not recognised"
+
+    # AllowsTearing=1 must NOT be mistaken for dropped=1.
+    frame = reader.feed("cs2.exe,4242,0x1234,DXGI,1,0,1,Hardware: Legacy Flip,0,1,0,"
+                        "12.5,8.3333")
+    assert frame is not None, frame
+    assert frame.app == "cs2.exe" and frame.pid == 4242
+    assert frame.dropped is False, "AllowsTearing was read as the drop flag"
+    assert abs(frame.frametime_ms - 8.3333) < 0.001, frame
+    assert abs(frame.timestamp - 12.5) < 0.001, frame
+
+    dropped = reader.feed("cs2.exe,4242,0x1234,DXGI,1,0,1,Hardware: Legacy Flip,0,1,1,"
+                          "13.0,999.0")
+    assert dropped is not None and dropped.dropped is True, dropped
+
+    # The 1.x layout has Dropped at position 6 and frametime further along.
+    v1 = PresentMonCsvReader()
+    v1.feed("Application,ProcessID,SwapChainAddress,Runtime,SyncInterval,PresentFlags,"
+            "Dropped,TimeInSeconds,MsBetweenPresents")
+    f1 = v1.feed("witcher3.exe,900,0x9,DXGI,1,0,0,5.0,16.6667")
+    assert f1 is not None and f1.pid == 900 and f1.dropped is False, f1
+    assert abs(f1.frametime_ms - 16.6667) < 0.001, f1
+
+    assert reader.rows == 2 and reader.malformed == 0
+    return "CSV columns resolved from the header in both metric layouts"
+
+
+def test_fps_csv_reader_survives_noise():
+    from sysmon.sensors.fps import PresentMonCsvReader
+    reader = PresentMonCsvReader()
+    reader.feed("Application,ProcessID,SwapChainAddress,Runtime,SyncInterval,PresentFlags,"
+                "Dropped,TimeInSeconds,MsBetweenPresents")
+    # PresentMon prints status chatter on the same stream as the CSV.
+    assert reader.feed("Started recording.  Stopped recording.") is None
+    assert reader.feed("") is None
+    assert reader.feed("\n") is None
+    assert reader.feed("Active swap chains: 3") is None
+    assert reader.rows == 0
+    frame = reader.feed("Game.exe,55,0x1,DXGI,1,0,0,1.0,20.0")
+    assert frame is not None and frame.pid == 55
+    return "CSV reader ignores PresentMon's status chatter"
+
+
+def test_fps_source_lifecycle():
+    from sysmon.sensors.base import Capability
+    from sysmon.sensors.fps import FpsSource
+    src = FpsSource()
+    src.start()
+    try:
+        caps = src.capabilities()
+        assert Capability.FPS in caps
+        snap = src.sample()
+        assert snap is not None
+        return f"fps source ok (available={snap.is_available})"
+    finally:
+        src.stop()
+
+
+def test_elevation_module():
+    from sysmon.elevation import (FLAG_ELEVATED, FLAG_NO_ADMIN, FLAG_NO_RELAUNCH,
+                                  is_admin, prepare_startup)
+
+    assert isinstance(is_admin(), bool)
+
+    # Internal flags must never leak through to the real argument parser, and a
+    # disabled elevation must leave argv untouched.
+    argv = ["--gui-interval", "2", FLAG_ELEVATED, FLAG_NO_ADMIN, FLAG_NO_RELAUNCH]
+    out = prepare_startup(argv, windowless=False)
+    assert out == ["--gui-interval", "2"], out
+
+    # A process that is already elevated must not re-launch itself.
+    if is_admin():
+        assert prepare_startup(["--gui"], windowless=False) == ["--gui"]
+        return "elevation ok (already admin)"
+
+    # Not admin: with elevation disabled it still runs in place.
+    assert prepare_startup(["--no-admin"], windowless=False) == []
+    return "elevation ok (helpers available, no relaunch attempted)"
+
+
 def test_cleaner_helpers():
-    from sysmon.cleaner import is_admin, get_available_memory_bytes, CleanResult, clean_ram, get_cleanable_cache_bytes
+    from sysmon.cleaner import (is_admin, get_available_memory_bytes, CleanResult,
+                            clean_ram, get_cleanable_cache_bytes)
 
     admin = is_admin()
     assert isinstance(admin, bool)

@@ -127,28 +127,48 @@ def run_thermal_worker(parent_pid: int) -> None:
     if sys.platform == "win32":
         try:
             import ctypes
+            import ctypes.wintypes as w
             SYNCHRONIZE = 0x00100000
             kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            # Without explicit signatures ctypes truncates the HANDLE to a 32-bit
+            # int on 64-bit Windows, so WaitForSingleObject gets a bogus handle and
+            # the worker never notices the parent exiting (leaking a process per run).
+            kernel32.OpenProcess.argtypes = (w.DWORD, w.BOOL, w.DWORD)
+            kernel32.OpenProcess.restype = w.HANDLE
+            kernel32.WaitForSingleObject.argtypes = (w.HANDLE, w.DWORD)
+            kernel32.WaitForSingleObject.restype = w.DWORD
+            kernel32.CloseHandle.argtypes = (w.HANDLE,)
+            kernel32.CloseHandle.restype = w.BOOL
             h_parent = kernel32.OpenProcess(SYNCHRONIZE, False, int(parent_pid))
+            if not h_parent:
+                h_parent = None
         except Exception:
             h_parent = None
 
     source = ThermalPowerSource()
     source.start()
 
+    # Deliberately no PresentMon here.  sysmon elevates itself now, so the
+    # process that owns the ETW frame-tracing session is the window itself; a
+    # second one would fight it for the same session name.
+
     ipc_path = get_ipc_temp_path()
     tmp_path = ipc_path + f".{os.getpid()}.tmp"
 
     try:
+        started = time.time()
+        max_lifetime = 6 * 60 * 60.0  # safety net so orphans cannot pile up
         while True:
             # Check if parent is still alive
             if kernel32 and h_parent:
-                wait_res = kernel32.WaitForSingleObject(h_parent, 800)
+                wait_res = kernel32.WaitForSingleObject(h_parent, 400)
                 # WAIT_OBJECT_0 (0) means the parent has exited!
                 if wait_res == 0:
                     break
             else:
-                time.sleep(0.8)
+                time.sleep(0.4)
+                if time.time() - started > max_lifetime:
+                    break
 
             temp, power, freq, max_freq = source.sample()
             if temp is not None:

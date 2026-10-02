@@ -1,5 +1,11 @@
 #!/usr/bin/env python
-"""Launch sysmon desktop GUI:  python sysmon.py"""
+"""Launch sysmon desktop GUI:  python sysmon.py
+
+Start-up order (see :mod:`sysmon.elevation`):
+  1. re-launch elevated through UAC unless the process already is an admin;
+  2. hand over to ``pythonw.exe`` so no console window is left behind;
+  3. run the GUI.
+"""
 
 import os
 import sys
@@ -7,42 +13,21 @@ import sys
 # Ensure repository root is on sys.path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-# If launched on Windows under python.exe / py.exe (e.g. double-clicked in Explorer),
-# re-spawn detached under pythonw.exe so the terminal / py.exe console window closes immediately!
-if sys.platform == "win32" and not (len(sys.argv) >= 3 and sys.argv[1] == "--thermal-worker"):
-    if "--no-relaunch" in sys.argv:
-        sys.argv.remove("--no-relaunch")
-    elif not sys.executable.lower().endswith("pythonw.exe"):
-        pythonw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
-        if not os.path.exists(pythonw):
-            pythonw = "pythonw.exe"
-        try:
-            import subprocess
-            DETACHED_PROCESS = 0x00000008
-            CREATE_NO_WINDOW = 0x08000000
-            subprocess.Popen(
-                [pythonw, os.path.abspath(__file__)] + sys.argv[1:],
-                creationflags=DETACHED_PROCESS | CREATE_NO_WINDOW,
-                close_fds=True,
-            )
-            sys.exit(0)
-        except Exception:
-            pass
-
-    # Fallback: hide console if already running in one
-    try:
-        import ctypes
-        hwnd = ctypes.windll.kernel32.GetConsoleWindow()
-        if hwnd:
-            ctypes.windll.user32.ShowWindow(hwnd, 0)
-    except Exception:
-        pass
+from sysmon.elevation import prepare_startup
 
 if __name__ == "__main__":
-    if len(sys.argv) >= 3 and sys.argv[1] == "--thermal-worker":
+    argv = sys.argv[1:]
+
+    if len(argv) >= 2 and argv[0] == "--thermal-worker":
         from sysmon.sensors.thermal import run_thermal_worker
-        run_thermal_worker(int(sys.argv[2]))
+        run_thermal_worker(int(argv[1]))
         sys.exit(0)
+
+    argv = prepare_startup(argv)
+    if argv is None:
+        # A privileged copy of this process took over.
+        sys.exit(0)
+    sys.argv = [sys.argv[0]] + argv
 
     from sysmon.gui import available
     if not available():

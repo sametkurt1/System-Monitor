@@ -8,7 +8,14 @@
     sysmon has no third-party dependencies: everything it needs is ctypes
     against DLLs that ship with Windows.
 
-    The optional CPU temperature/power provider is deliberately NOT bundled.
+    The executable is built with a requireAdministrator manifest (--uac-admin),
+    because PresentMon (in-game FPS) and LibreHardwareMonitor (CPU temperature)
+    both refuse to produce readings without elevation.
+
+    PresentMon_x64.exe IS bundled: it is the only way to get frame timings and
+    it is a single self-contained binary.
+
+    The optional CPU temperature/power library is deliberately NOT bundled.
     It needs a CLR host and a kernel driver, so the built exe reports N/A for
     those two fields until the user opts in (see README.md).
 
@@ -41,7 +48,9 @@ if ($LASTEXITCODE -ne 0) { throw "pip install pyinstaller failed" }
 
 $hidden = @(
     '--hidden-import', 'sysmon.sensors.cpu_ntdll',
+    '--hidden-import', 'sysmon.sensors.fps',
     '--hidden-import', 'sysmon.gui.main_window',
+    '--hidden-import', 'sysmon.gui.overlay',
     '--hidden-import', 'sysmon.gui.sampler',
     '--hidden-import', 'sysmon.gui.widgets'
 )
@@ -77,6 +86,8 @@ Write-Host "Building single-file executable..." -ForegroundColor Cyan
     --workpath build `
     --specpath . `
     --console `
+    --uac-admin `
+    --add-binary "sysmon\sensors\PresentMon_x64.exe;sysmon\sensors" `
     $hidden `
     $guiHolds `
     sysmon.py

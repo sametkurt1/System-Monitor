@@ -58,6 +58,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="quit automatically after SEC seconds (for smoke tests / CI)")
     p.add_argument("--clean-ram", action="store_true",
                    help="purge standby list and system file cache, then exit")
+    p.add_argument("--no-admin", action="store_true",
+                   help="do not request Administrator rights (disables CPU temperature "
+                        "and in-game FPS, which are the two sensors that need them)")
     p.add_argument("--version", action="version", version=f"sysmon {__version__}")
 
     sub = p.add_subparsers(dest="command")
@@ -76,8 +79,19 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
+    from .elevation import prepare_startup
+
+    argv = list(sys.argv[1:] if argv is None else argv)
+    # UAC hand-off happens before parsing so a non-interactive invocation
+    # (shortcut, --once, CI) behaves the same as the desktop one.  The console
+    # is kept because the terminal UI draws into it.  Returns None when a
+    # privileged copy took over.
+    started_elsewhere = prepare_startup(argv, windowless=False)
+    if started_elsewhere is None:
+        return 0
+
     parser = build_parser()
-    args = parser.parse_args(argv)
+    args = parser.parse_args(started_elsewhere)
 
     if args.command == "diagnose":
         return _cmd_diagnose(args)
@@ -142,7 +156,8 @@ def _cmd_diagnose(args) -> int:
         if args.json:
             import json
             payload = {}
-            for prov in (collector.cpu, collector.memory, collector.gpu, collector.thermal):
+            for prov in (collector.cpu, collector.memory, collector.gpu,
+                         collector.thermal, collector.fps):
                 if prov is None:
                     continue
                 try:

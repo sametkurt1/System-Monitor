@@ -7,6 +7,7 @@ UI renders as ``N/A``.
 
 from .base import Capability, CapabilityState, Provider, Status
 from .cpu import CpuSource
+from .fps import FpsSource
 from .gpu import NvidiaSource
 from .memory import MemorySource
 from .thermal import ThermalPowerSource
@@ -15,6 +16,7 @@ __all__ = [
     "Capability",
     "CapabilityState",
     "CpuSource",
+    "FpsSource",
     "NvidiaSource",
     "MemorySource",
     "Provider",

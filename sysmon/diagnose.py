@@ -16,7 +16,7 @@ def _mark(state: CapabilityState) -> str:
 
 
 def report(collector=None, width: int = 100) -> List[str]:
-    from .sensors import CpuSource, MemorySource, NvidiaSource, ThermalPowerSource
+    from .sensors import CpuSource, FpsSource, MemorySource, NvidiaSource, ThermalPowerSource
 
     out: List[str] = []
     out.append("=" * min(width, 78))
@@ -25,16 +25,21 @@ def report(collector=None, width: int = 100) -> List[str]:
     out.append(f" python      {sys.version.split()[0]}  ({sys.executable})")
     out.append(f" platform    {sys.platform}")
     out.append(f" elevated    {'yes' if is_elevated() else 'no'}"
-               + ("" if is_elevated() else "   (needed for CPU temperature / power)"))
+               + ("" if is_elevated() else "   (needed for CPU temperature / FPS)"))
     asm = find_assembly()
     out.append(f" LHM dll     {asm or 'not installed (optional)'}")
+    from .sensors.fps import find_presentmon
+    presentmon = find_presentmon()
+    out.append(f" PresentMon  {presentmon or 'not found (needed for in-game FPS)'}")
     out.append("")
 
+    fps_provider = getattr(collector, "fps", None) if collector else None
     providers = [p for p in (
         collector.cpu if collector else CpuSource(),
         collector.memory if collector else MemorySource(),
         collector.gpu if collector else NvidiaSource(),
         collector.thermal if collector else ThermalPowerSource(),
+        fps_provider if fps_provider is not None else FpsSource(),
     ) if p is not None]
 
     for prov in providers:

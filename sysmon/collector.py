@@ -6,8 +6,9 @@ import time
 from dataclasses import replace
 from typing import List
 
-from .models import CpuSnapshot, GpuSnapshot, MemorySnapshot, Snapshot
-from .sensors import CpuSource, MemorySource, NvidiaSource, ThermalPowerSource
+from .models import CpuSnapshot, FpsSnapshot, GpuSnapshot, MemorySnapshot, Snapshot
+from .sensors import (CpuSource, FpsSource, MemorySource, NvidiaSource,
+                      ThermalPowerSource)
 
 
 class Collector:
@@ -18,11 +19,13 @@ class Collector:
     """
 
     def __init__(self, enable_cpu: bool = True, enable_memory: bool = True,
-                 enable_gpu: bool = True, enable_thermal: bool = True) -> None:
+                 enable_gpu: bool = True, enable_thermal: bool = True,
+                 enable_fps: bool = True) -> None:
         self.cpu = CpuSource() if enable_cpu else None
         self.memory = MemorySource() if enable_memory else None
         self.gpu = NvidiaSource() if enable_gpu else None
         self.thermal = ThermalPowerSource() if enable_thermal else None
+        self.fps = FpsSource() if enable_fps else None
         self.problems: List[str] = []
         self._started = False
 
@@ -31,7 +34,7 @@ class Collector:
     def start(self) -> None:
         if self._started:
             return
-        for prov in (self.cpu, self.memory, self.gpu, self.thermal):
+        for prov in (self.cpu, self.memory, self.gpu, self.thermal, self.fps):
             if prov is None:
                 continue
             try:
@@ -41,7 +44,7 @@ class Collector:
         self._started = True
 
     def stop(self) -> None:
-        for prov in (self.cpu, self.memory, self.gpu, self.thermal):
+        for prov in (self.cpu, self.memory, self.gpu, self.thermal, self.fps):
             if prov is None:
                 continue
             try:
@@ -62,7 +65,7 @@ class Collector:
     def notes(self) -> List[str]:
         """Human-readable notes about metrics that are unavailable, and why."""
         out: List[str] = []
-        for prov in (self.cpu, self.memory, self.gpu, self.thermal):
+        for prov in (self.cpu, self.memory, self.gpu, self.thermal, self.fps):
             if prov is None:
                 continue
             try:
@@ -81,6 +84,7 @@ class Collector:
         cpu: CpuSnapshot = CpuSnapshot()
         mem: MemorySnapshot = MemorySnapshot()
         gpus: List[GpuSnapshot] = []
+        fps: FpsSnapshot = FpsSnapshot()
 
         if self.cpu is not None:
             try:
@@ -104,6 +108,14 @@ class Collector:
             except Exception as exc:
                 self.problems.append(f"gpu: {exc}")
 
+        if self.fps is not None:
+            try:
+                got_fps = self.fps.sample()
+                if got_fps is not None:
+                    fps = got_fps
+            except Exception as exc:
+                self.problems.append(f"fps: {exc}")
+
         # Merge optional temperature / power / real frequency into the CPU snapshot.
         if self.thermal is not None:
             try:
@@ -120,7 +132,7 @@ class Collector:
             except Exception as exc:
                 self.problems.append(f"thermal: {exc}")
 
-        return Snapshot(monotonic=time.monotonic(), cpu=cpu, memory=mem, gpus=tuple(gpus))
+        return Snapshot(monotonic=time.monotonic(), cpu=cpu, memory=mem, gpus=tuple(gpus), fps=fps)
 
     def gpus(self) -> List[GpuSnapshot]:
         try:

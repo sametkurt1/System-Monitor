@@ -437,3 +437,69 @@ else:
         finally:
             win.close()
         return "every custom widget repaints without error"
+
+    def test_gui_overlay_window():
+        application = app()
+        from sysmon.gui.overlay import OverlayWindow
+        from sysmon.models import FpsSnapshot, Snapshot, CpuSnapshot, GpuSnapshot, MemorySnapshot
+
+        ov = OverlayWindow()
+        try:
+            # Test position switching
+            ov.set_position(OverlayWindow.POSITION_TOP_LEFT)
+            ov.set_position(OverlayWindow.POSITION_TOP_RIGHT)
+            ov.set_position(OverlayWindow.POSITION_BOTTOM_LEFT)
+            ov.set_position(OverlayWindow.POSITION_BOTTOM_RIGHT)
+
+            # Test mode switching
+            ov.set_mode(OverlayWindow.MODE_FULL)
+            ov.set_mode(OverlayWindow.MODE_COMPACT)
+            ov.set_mode(OverlayWindow.MODE_FULL)
+
+            # Test click-through
+            ov.set_click_through(True)
+            ov.set_click_through(False)
+
+            # Test updating snapshot with live game data
+            snap = Snapshot(
+                cpu=CpuSnapshot(usage=45.0, temperature_c=62.0, frequency_mhz=4600.0),
+                memory=MemorySnapshot(usage=50.0, used_bytes=8 * 1024**3, total_bytes=16 * 1024**3),
+                gpus=(GpuSnapshot(usage=88.0, temperature_c=68.0, memory_used_bytes=10 * 1024**3),),
+                fps=FpsSnapshot(fps=144.0, frametime_ms=6.94, fps_1percent_low=118.0,
+                                app_name="Cyberpunk2077.exe", is_active=True, is_available=True)
+            )
+            ov.update_snapshot(snap)
+            assert "Cyberpunk2077" in ov.game_lbl.text()
+            assert "144" in ov.fps_val.text()
+
+            # Test empty snapshot
+            ov.update_snapshot(Snapshot())
+            assert "--" in ov.fps_val.text()
+
+            ov.show()
+            application.processEvents()
+            return "overlay window builds, renders and switches modes cleanly"
+        finally:
+            ov.close()
+
+    def test_gui_overlay_toggle():
+        application = app()
+        from sysmon.gui.main_window import MainWindow
+
+        win = MainWindow(interval=1.0)
+        try:
+            assert hasattr(win, "overlay_btn")
+            assert not win.overlay_btn.isChecked()
+
+            # Toggle ON
+            win.overlay_btn.setChecked(True)
+            assert win.overlay.isVisible()
+
+            # Toggle OFF
+            win.overlay_btn.setChecked(False)
+            assert not win.overlay.isVisible()
+
+            application.processEvents()
+            return "overlay button toggles overlay visibility correctly"
+        finally:
+            win.close()

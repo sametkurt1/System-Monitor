@@ -14,6 +14,9 @@ dist/
 # It ships a kernel driver; keeping it out of version control is deliberate.
 sysmon/sensors/*.dll
 
+# PresentMon is Intel/NVIDIA redistributable, not ours; build_exe.ps1 bundles it.
+sysmon/sensors/PresentMon*.exe
+
 # Editors / OS
 .vscode/
 .idea/

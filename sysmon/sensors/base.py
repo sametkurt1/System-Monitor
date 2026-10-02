@@ -24,6 +24,7 @@ class Capability(Enum):
     CPU_POWER = "cpu.power"
     MEMORY = "memory"
     GPU = "gpu"
+    FPS = "fps"
 
 
 class Status(Enum):

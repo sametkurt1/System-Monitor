@@ -92,6 +92,24 @@ class GpuSnapshot:
 
 
 @dataclass(frozen=True)
+class FpsSnapshot:
+    """Live in-game frame rate and frametime metrics."""
+
+    fps: Optional[float] = None
+    frametime_ms: Optional[float] = None
+    fps_1percent_low: Optional[float] = None
+    app_name: Optional[str] = None
+    pid: Optional[int] = None
+    is_active: bool = False
+    is_available: bool = False
+    detail: str = ""
+
+    @property
+    def has_fps(self) -> bool:
+        return self.fps is not None and self.is_active
+
+
+@dataclass(frozen=True)
 class Snapshot:
     """One complete sample of every monitored category."""
 
@@ -99,3 +117,4 @@ class Snapshot:
     cpu: CpuSnapshot = field(default_factory=CpuSnapshot)
     memory: MemorySnapshot = field(default_factory=MemorySnapshot)
     gpus: Sequence[GpuSnapshot] = field(default_factory=tuple)
+    fps: FpsSnapshot = field(default_factory=FpsSnapshot)

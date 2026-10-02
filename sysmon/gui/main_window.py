@@ -8,6 +8,8 @@ between samples so 1 Hz updates read as motion rather than jumps.
 
 from __future__ import annotations
 
+import os
+import sys
 import time
 from collections import deque
 from typing import List
@@ -17,6 +19,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from ..formatting import human_freq, human_gb, human_temp, human_watt
 from ..models import Snapshot
 from . import theme as T
+from .overlay import OverlayWindow
 from .sampler import SamplerThread
 from .widgets import (BarGauge, Card, CoreGrid, ElidedLabel, Gauge, Sparkline,
                       StatRow, make_icon, make_tray_icon)
@@ -60,6 +63,22 @@ class MainWindow(QtWidgets.QMainWindow):
         self._force_quit = False
         self._notes: List[str] = []
         self._show_cores = show_cores
+        self._elevating = False
+
+        self.overlay = OverlayWindow(parent=None)
+        self._hotkey_id = 101
+        self._hotkey_registered = False
+        if sys.platform == "win32":
+            try:
+                import ctypes
+                user32 = ctypes.windll.user32
+                MOD_NOREPEAT = 0x4000
+                VK_F11 = 0x7A
+                hwnd = int(self.winId())
+                if user32.RegisterHotKey(hwnd, self._hotkey_id, MOD_NOREPEAT, VK_F11):
+                    self._hotkey_registered = True
+            except Exception:
+                pass
 
         self._init_tray()
 
@@ -108,6 +127,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
         show_act = tray_menu.addAction("Show Window")
         show_act.triggered.connect(self._show_from_tray)
+
+        overlay_act = tray_menu.addAction("🎮 Toggle FPS Overlay (F11)")
+        overlay_act.triggered.connect(lambda: self.overlay_btn.toggle())
 
         clean_act = tray_menu.addAction("Clean Standby Cache")
         clean_act.triggered.connect(self._on_clean_ram)
@@ -241,10 +263,21 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tray_btn.toggled.connect(self._on_tray_toggle)
         bar.addWidget(self.tray_btn)
 
-        from ..cleaner import is_admin
+        self.overlay_btn = QtWidgets.QPushButton("🎮 Overlay")
+        self.overlay_btn.setCheckable(True)
+        self.overlay_btn.setToolTip("Toggle in-game FPS & Hardware Overlay (Hotkey: F11)\nRight-click for Position and Mode settings")
+        self.overlay_btn.setCursor(QtCore.Qt.PointingHandCursor)
+        self.overlay_btn.setFixedHeight(27)
+        self.overlay_btn.setStyleSheet(self._button_qss())
+        self.overlay_btn.toggled.connect(self._on_overlay_toggle)
+        self.overlay_btn.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
+        self.overlay_btn.customContextMenuRequested.connect(self._show_overlay_menu)
+        bar.addWidget(self.overlay_btn)
+
+        from ..elevation import is_admin
         if not is_admin():
             self.admin_btn = QtWidgets.QPushButton("🛡️ Admin")
-            self.admin_btn.setToolTip("Restart sysmon as Administrator to enable CPU temperature sensors")
+            self.admin_btn.setToolTip("CPU temperature and in-game FPS were unavailable because sysmon is not elevated.\nThis window was started with --no-admin; relaunch to enable them.")
             self.admin_btn.setCursor(QtCore.Qt.PointingHandCursor)
             self.admin_btn.setFixedHeight(27)
             self.admin_btn.setStyleSheet(f"""
@@ -267,7 +300,7 @@ class MainWindow(QtWidgets.QMainWindow):
             bar.addWidget(self.admin_btn)
         else:
             self.admin_badge = QtWidgets.QLabel("🛡️ Admin")
-            self.admin_badge.setToolTip("Running with Administrator privileges (full sensor & cache access)")
+            self.admin_badge.setToolTip("Running with Administrator privileges - all sensors are live,\nincluding CPU temperature and in-game FPS tracking")
             self.admin_badge.setFixedHeight(27)
             self.admin_badge.setAlignment(QtCore.Qt.AlignCenter)
             self.admin_badge.setStyleSheet(f"""
@@ -432,8 +465,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.status = QtWidgets.QLabel("")
         self.status.setFont(T.font(10.0))
         self.status.setStyleSheet(f"color: {T.FG_DIM};")
+        # Action feedback has to survive the 1 Hz status refresh, otherwise the
+        # message is overwritten before the eye can catch it.
+        self._status_until = 0.0
+        self._status_override = ""
         bar.addWidget(self.status, 1)
-        hint = QtWidgets.QLabel("Space pause  \u00b7  C clean RAM  \u00b7  R refresh  \u00b7  Esc quit")
+        hint = QtWidgets.QLabel("Space pause  \u00b7  F11 overlay  \u00b7  C clean RAM  \u00b7  R refresh  \u00b7  Esc quit")
         hint.setFont(T.font(10.0))
         hint.setStyleSheet(f"color: {T.FG_DIM};")
         bar.addWidget(hint)
@@ -496,6 +533,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.close()
         elif key == QtCore.Qt.Key.Key_Space:
             self.pause_btn.toggle()
+        elif key == QtCore.Qt.Key.Key_F11:
+            self.overlay_btn.toggle()
         elif key == QtCore.Qt.Key.Key_C:
             self._on_clean_ram()
         elif key == QtCore.Qt.Key.Key_R:
@@ -506,24 +545,126 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             super().keyPressEvent(event)
 
-    def _on_run_as_admin(self) -> None:
-        from ..cleaner import is_admin
-        from ..sensors.thermal import read_ipc_temperature, start_thermal_worker_elevated
+    def nativeEvent(self, eventType, message):  # noqa: N802
+        if sys.platform == "win32" and getattr(self, "_hotkey_registered", False):
+            try:
+                import ctypes.wintypes as w
+                msg = w.MSG.from_address(int(message))
+                WM_HOTKEY = 0x0312
+                if msg.message == WM_HOTKEY and msg.wParam == getattr(self, "_hotkey_id", 101):
+                    if hasattr(self, "overlay_btn"):
+                        self.overlay_btn.toggle()
+            except Exception:
+                pass
+        return super().nativeEvent(eventType, message)
 
+    def _on_overlay_toggle(self, checked: bool) -> None:
+        if checked:
+            if self._last:
+                self.overlay.update_snapshot(self._last)
+            self.overlay.show()
+            self._flash_status("🎮 In-game FPS overlay active (Press F11 to toggle)")
+        else:
+            self.overlay.hide()
+            self._flash_status("🎮 In-game FPS overlay hidden")
+
+    def _show_overlay_menu(self, pos) -> None:
+        menu = QtWidgets.QMenu(self)
+        menu.setStyleSheet(f"""
+            QMenu {{
+                background: {T.CARD};
+                border: 1px solid {T.CARD_BORDER};
+                color: {T.FG};
+                padding: 4px;
+            }}
+            QMenu::item {{
+                padding: 5px 20px;
+                border-radius: 4px;
+            }}
+            QMenu::item:selected {{
+                background: {T.alpha_css(T.qcolor(T.ACCENT, 40))};
+                color: {T.FG_TITLE};
+            }}
+        """)
+
+        pos_menu = menu.addMenu("📍 Overlay Position")
+        positions = [
+            ("Top-Left (Default)", OverlayWindow.POSITION_TOP_LEFT),
+            ("Top-Right", OverlayWindow.POSITION_TOP_RIGHT),
+            ("Bottom-Left", OverlayWindow.POSITION_BOTTOM_LEFT),
+            ("Bottom-Right", OverlayWindow.POSITION_BOTTOM_RIGHT),
+        ]
+        for label, p_val in positions:
+            act = pos_menu.addAction(label)
+            act.setCheckable(True)
+            act.setChecked(self.overlay._position == p_val)
+            act.triggered.connect(lambda chk=False, pv=p_val: self.overlay.set_position(pv))
+
+        mode_menu = menu.addMenu("📊 Display Mode")
+        full_act = mode_menu.addAction("Full HUD (FPS + CPU/GPU/RAM)")
+        full_act.setCheckable(True)
+        full_act.setChecked(self.overlay._mode == OverlayWindow.MODE_FULL)
+        full_act.triggered.connect(lambda: self.overlay.set_mode(OverlayWindow.MODE_FULL))
+
+        compact_act = mode_menu.addAction("Compact (FPS only)")
+        compact_act.setCheckable(True)
+        compact_act.setChecked(self.overlay._mode == OverlayWindow.MODE_COMPACT)
+        compact_act.triggered.connect(lambda: self.overlay.set_mode(OverlayWindow.MODE_COMPACT))
+
+        ct_act = menu.addAction("Click-Through (Pass clicks to game)")
+        ct_act.setCheckable(True)
+        ct_act.setChecked(self.overlay._click_through)
+        ct_act.triggered.connect(lambda checked: self.overlay.set_click_through(checked))
+
+        menu.addSeparator()
+        toggle_act = menu.addAction("Toggle Overlay (F11)")
+        toggle_act.triggered.connect(lambda: self.overlay_btn.toggle())
+
+        menu.exec(self.overlay_btn.mapToGlobal(pos))
+
+    def _on_run_as_admin(self) -> None:
+        from ..elevation import is_admin
+        from ..sensors.thermal import (read_ipc_temperature,
+                                       start_thermal_worker_elevated)
+
+        if getattr(self, "_elevating", False):
+            return
         if is_admin() or read_ipc_temperature() is not None:
-            self.status.setText("✓ CPU temperature sensor is already active.")
+            self._flash_status("\u2713 CPU temperature sensor is already active.")
             return
 
-        self.status.setText("⚡ Requesting administrator permission for CPU temperature...")
+        self._elevating = True
+        self._flash_status("\u26a1 Requesting administrator permission for CPU temperature...")
         QtWidgets.QApplication.processEvents()
 
-        success, msg = start_thermal_worker_elevated(os.getpid())
-        if success:
-            self.status.setText("⚡ Elevated sensor starting...")
-            self.sampler.set_interval(0.2)
-            QtCore.QTimer.singleShot(1500, lambda: self.sampler.set_interval(self.interval_box.currentData()))
+        try:
+            success, msg = start_thermal_worker_elevated(os.getpid())
+        except Exception as exc:
+            success, msg = False, f"Elevation error: {exc}"
+        finally:
+            self._elevating = False
+
+        if not success:
+            self._flash_status(f"\u26a0\ufe0f {msg}", seconds=8.0)
+            return
+
+        # Elevation is silent on machines configured to elevate without prompting,
+        # so confirm success by waiting for the worker to actually deliver a value.
+        self._flash_status("\u26a1 Elevated sensor starting\u2026")
+        self.sampler.set_interval(0.2)
+        QtCore.QTimer.singleShot(1500, lambda: self.sampler.set_interval(
+            self.interval_box.currentData()))
+        QtCore.QTimer.singleShot(6000, self._verify_thermal_worker)
+
+    def _verify_thermal_worker(self) -> None:
+        """Report whether the elevated worker really started delivering values."""
+        from ..sensors.thermal import read_ipc_temperature
+        if read_ipc_temperature() is not None:
+            self._flash_status("\u2713 CPU temperature sensor active.")
         else:
-            self.status.setText(f"⚠️ {msg}")
+            self._flash_status(
+                "\u26a0\ufe0f Elevated sensor did not report a temperature. "
+                "Press 'i' for diagnostics.", seconds=10.0)
 
     def _on_clean_ram(self) -> None:
         if getattr(self, "_cleaning_ram", False):
@@ -533,7 +674,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.clean_btn.setText("Cleaning...")
         self.mem_clean_btn.setEnabled(False)
         self.mem_clean_btn.setText("Cleaning cache...")
-        self.status.setText("⚡ Purging standby list & system file cache...")
+        self._flash_status("\u26a1 Purging standby list & system file cache...")
 
         self._clean_thread = _CleanerThread(parent=self)
         self._clean_thread.finishedClean.connect(self._on_clean_finished)
@@ -547,7 +688,7 @@ class MainWindow(QtWidgets.QMainWindow):
             freed_str = f"Freed {human_gb(result.freed_bytes)}" if result.freed_bytes > 0 else "Cache clean!"
             self.clean_btn.setText(freed_str)
             self.mem_clean_btn.setText(f"✓ {freed_str}")
-            self.status.setText(f"✓ {result.message}")
+            self._flash_status(f"\u2713 {result.message}", seconds=6.0)
             if hasattr(self, "tray_icon") and self.tray_icon and not self.isVisible():
                 self.tray_icon.showMessage(
                     "sysmon — Standby Cache",
@@ -561,7 +702,7 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             self.clean_btn.setText("Clean RAM")
             self.mem_clean_btn.setText("⚡ Clean Standby Cache")
-            self.status.setText(f"⚠️ {result.message}")
+            self._flash_status(f"\u26a0\ufe0f {result.message}", seconds=8.0)
             if hasattr(self, "tray_icon") and self.tray_icon and not self.isVisible():
                 self.tray_icon.showMessage(
                     "sysmon — Standby Cache",
@@ -596,6 +737,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self._anim.stop()
         self._clock.stop()
         self.sampler.stop()
+        if getattr(self, "_hotkey_registered", False):
+            try:
+                import ctypes
+                ctypes.windll.user32.UnregisterHotKey(int(self.winId()), self._hotkey_id)
+            except Exception:
+                pass
+        if hasattr(self, "overlay") and self.overlay:
+            self.overlay.close()
         if hasattr(self, "tray_icon") and self.tray_icon:
             self.tray_icon.hide()
         super().closeEvent(event)
@@ -603,7 +752,7 @@ class MainWindow(QtWidgets.QMainWindow):
     # ------------------------------------------------------------ snapshot
 
     def _on_failed(self, message: str) -> None:
-        self.status.setText(f"\u26a0 {message}")
+        self._flash_status(f"\u26a0 {message}", seconds=8.0)
 
     def _on_notes(self, notes: List[str]) -> None:
         self._notes = list(notes)
@@ -620,6 +769,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._render_gpu(snap)
         self._render_cores(snap)
         self._render_status(snap)
+        if hasattr(self, "overlay") and self.overlay and self.overlay.isVisible():
+            self.overlay.update_snapshot(snap)
 
     # -------------------------------------------------------------- render
 
@@ -658,7 +809,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 "N/A", T.qcolor(T.FG_DIM),
                 "Max/boost frequency not found for this CPU model.")
 
-        from ..cleaner import is_admin
+        from ..elevation import is_admin
         from ..sensors.thermal import read_ipc_temperature
         if cpu.temperature_c is not None:
             self.cpu_temp.set_value(human_temp(cpu.temperature_c), T.temp_q(cpu.temperature_c),
@@ -679,9 +830,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 }}
                 """)
         elif not is_admin() and read_ipc_temperature() is None:
-            self.cpu_temp.set_value("N/A (click to elevate)", T.qcolor(T.ACCENT),
-                                    "CPU temperature requires Administrator privileges.\n"
-                                    "Click here or 'Admin' in the toolbar to enable.")
+            self.cpu_temp.set_value("N/A (no sensor)", T.qcolor(T.ACCENT),
+                                    "No CPU temperature sensor is available.\n"
+                                    "Run elevated with 'sysmon sensors install' to add "
+                                    "the LibreHardwareMonitor provider.")
         else:
             self.cpu_temp.set_value("N/A", T.qcolor(T.FG_DIM),
                                     "No CPU temperature sensor reported by hardware monitor")
@@ -808,8 +960,24 @@ class MainWindow(QtWidgets.QMainWindow):
             self.cores_card.set_badge(
                 f"{len(values)} logical" if values else "unavailable", T.FG_DIM)
 
+    def _flash_status(self, text: str, seconds: float = 5.0) -> None:
+        """Show a message that survives the periodic status refresh.
+
+        The status bar is rewritten on every sample, so without this an action's
+        result is gone within one refresh interval and the click looks inert.
+        """
+        self._status_override = text
+        self._status_until = time.monotonic() + seconds
+        self.status.setText(text)
+
     def _render_status(self, snap: Snapshot) -> None:
+        # A pending action message outranks the routine status line.
+        if self._status_override and time.monotonic() < self._status_until:
+            return
+        self._status_override = ""
         bits = []
+        if snap.fps and snap.fps.has_fps:
+            bits.append(f"🎮 {snap.fps.fps:.0f} FPS ({snap.fps.app_name})")
         if self._enabled["GPU"] and snap.gpus:
             bits.append(f"GPU driver {snap.gpus[0].driver_version or '?'}")
         bits.append(f"refresh {self.sampler.interval:g}s")

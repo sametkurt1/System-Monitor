@@ -10,6 +10,7 @@ Windows APIs expect.
 from __future__ import annotations
 
 import threading
+import time
 from typing import Optional
 
 from PySide6 import QtCore
@@ -18,6 +19,7 @@ from ..collector import Collector
 
 MIN_INTERVAL = 0.2
 MAX_INTERVAL = 10.0
+NOTES_INTERVAL = 10.0
 
 
 class SamplerThread(QtCore.QThread):
@@ -29,10 +31,10 @@ class SamplerThread(QtCore.QThread):
 
     def __init__(self, interval: float = 1.0, enable_cpu: bool = True,
                  enable_memory: bool = True, enable_gpu: bool = True,
-                 enable_thermal: bool = True, parent=None) -> None:
+                 enable_thermal: bool = True, enable_fps: bool = True, parent=None) -> None:
         super().__init__(parent)
         self._interval = max(MIN_INTERVAL, min(MAX_INTERVAL, interval))
-        self._enable = (enable_cpu, enable_memory, enable_gpu, enable_thermal)
+        self._enable = (enable_cpu, enable_memory, enable_gpu, enable_thermal, enable_fps)
         self._stop = threading.Event()
         self._collector: Optional[Collector] = None
         self._ready = False
@@ -54,9 +56,10 @@ class SamplerThread(QtCore.QThread):
     # ----------------------------------------------------------------- loop
 
     def run(self) -> None:  # noqa: D102 - QThread entry point
-        cpu, memory, gpu, thermal = self._enable
+        cpu, memory, gpu, thermal, fps = self._enable
         collector = Collector(enable_cpu=cpu, enable_memory=memory,
-                              enable_gpu=gpu, enable_thermal=thermal)
+                              enable_gpu=gpu, enable_thermal=thermal,
+                              enable_fps=fps)
         self._collector = collector
         try:
             collector.start()
@@ -67,6 +70,7 @@ class SamplerThread(QtCore.QThread):
             if first is not None:
                 self.snapshotReady.emit(first)
             self._ready = True
+            last_notes = time.monotonic()
 
             while not self._stop.is_set():
                 if self._stop.wait(self._interval):
@@ -78,6 +82,15 @@ class SamplerThread(QtCore.QThread):
                     continue
                 if snap is not None:
                     self.snapshotReady.emit(snap)
+                # Re-probe availability periodically: enabling the elevated
+                # thermal sensor changes what is reachable, and a note captured
+                # only at startup would stay stale and misleading.
+                if time.monotonic() - last_notes >= NOTES_INTERVAL:
+                    last_notes = time.monotonic()
+                    try:
+                        self.notesReady.emit(list(collector.notes()))
+                    except Exception:
+                        pass
         except Exception as exc:  # pragma: no cover - defensive
             self.failed.emit(str(exc))
         finally:
