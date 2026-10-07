@@ -148,9 +148,13 @@ def run_thermal_worker(parent_pid: int) -> None:
     source = ThermalPowerSource()
     source.start()
 
-    # Deliberately no PresentMon here.  sysmon elevates itself now, so the
-    # process that owns the ETW frame-tracing session is the window itself; a
-    # second one would fight it for the same session name.
+    fps_source = None
+    try:
+        from .fps import FpsSource
+        fps_source = FpsSource()
+        fps_source.start()
+    except Exception:
+        fps_source = None
 
     ipc_path = get_ipc_temp_path()
     tmp_path = ipc_path + f".{os.getpid()}.tmp"
@@ -178,8 +182,19 @@ def run_thermal_worker(parent_pid: int) -> None:
                     os.replace(tmp_path, ipc_path)
                 except Exception:
                     pass
+
+            if fps_source is not None:
+                try:
+                    fps_source.sample()
+                except Exception:
+                    pass
     finally:
         source.stop()
+        if fps_source is not None:
+            try:
+                fps_source.stop()
+            except Exception:
+                pass
         if kernel32 and h_parent:
             try:
                 kernel32.CloseHandle(h_parent)
@@ -268,6 +283,94 @@ def start_thermal_worker_elevated(parent_pid: int) -> Tuple[bool, str]:
         return True, "Elevated thermal service launched"
     except Exception as exc:
         return False, f"Elevation error: {exc}"
+
+
+def _driver_block_reason(asm) -> Optional[str]:
+    """Why LibreHardwareMonitor's kernel driver is unusable, if it is.
+
+    WinRing0 is on the Microsoft vulnerable-driver blocklist, so Defender
+    quarantines it (it is extracted next to the running executable, hence
+    ``pythonw.sys``) and every MSR read then returns 0.  Reporting "active"
+    here would send the user hunting for a cause that is not in their code.
+    """
+    try:
+        ring = asm.GetType("LibreHardwareMonitor.Hardware.Ring0")
+        if ring is None:
+            return None
+        is_open = ring.GetProperty("IsOpen").GetValue(None, None)
+        if is_open:
+            return None
+        report = ""
+        try:
+            report = str(ring.GetMethod("GetReport").Invoke(None, None) or "")
+        except Exception:
+            pass
+    except Exception:
+        return None
+
+    detail = "kernel driver did not start"
+    if "00000005" in report:
+        return "LibreHardwareMonitor needs Administrator rights (OpenSCManager access denied)"
+    if "winring0" in report.lower():
+        detail = "kernel driver WinRing0 did not start"
+    quarantined = _defender_quarantined_driver()
+    if quarantined:
+        return (f"blocked by Defender ({quarantined}); LibreHardwareMonitor's kernel "
+                "driver cannot load, so no CPU temperature is available")
+    return (f"LibreHardwareMonitor {detail} - no CPU temperature available "
+            "(this is the WinRing0 vulnerable-driver block, not a sysmon bug)")
+
+
+def _defender_quarantined_driver() -> Optional[str]:
+    """Ask Defender whether it has blocked a ring-0 style driver, cheaply."""
+    if sys.platform != "win32":
+        return None
+    try:
+        import subprocess
+        script = (
+            "$t = Get-MpThreatDetection -ErrorAction SilentlyContinue | "
+            "Where-Object { $_.ThreatName -match 'Ring|VulnerableDriver' } | "
+            "Select-Object -First 1 -ExpandProperty ThreatName; "
+            "if (-not $t) { "
+            "  $t = Get-MpThreat -ErrorAction SilentlyContinue | "
+            "  Where-Object { $_.ThreatName -match 'Ring|VulnerableDriver' -and $_.Resources -match 'sysmon|python|ring' } | "
+            "  Select-Object -First 1 -ExpandProperty ThreatName; "
+            "}; "
+            "if ($t) { $t }"
+        )
+        proc = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL, timeout=5,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000),
+        )
+        found = (proc.stdout or b"").decode("utf-8", "replace").strip()
+        return found or None
+    except Exception:
+        return None
+
+
+def _read_wmi_temperature() -> Optional[float]:
+    """Fallback CPU / ACPI thermal reading from WMI if available."""
+    if sys.platform != "win32":
+        return None
+    try:
+        import subprocess
+        script = "(Get-CimInstance -Namespace root/wmi -ClassName MSAcpi_ThermalZoneTemperature -ErrorAction SilentlyContinue | Select-Object -First 1).CurrentTemperature"
+        proc = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL, timeout=2,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000),
+        )
+        out = (proc.stdout or b"").decode("utf-8", "replace").strip()
+        if out and out.isdigit():
+            val = (int(out) - 2732) / 10.0
+            if 0.0 < val < 150.0:
+                return round(val, 1)
+    except Exception:
+        pass
+    return None
 
 
 class PdhEnergyMeter:
@@ -364,8 +467,11 @@ class ThermalPowerSource:
     def __init__(self) -> None:
         self._computer = None
         self._ready = False
+        self._saw_temp = False
+        self._asm = None
         self._reason = "not started"
         self._states: Dict[Capability, CapabilityState] = {}
+        self._saw_temp = False
         self._last_temp: Optional[float] = None
         self._last_power: Optional[float] = None
         self._last_freq: Optional[float] = None
@@ -375,21 +481,24 @@ class ThermalPowerSource:
     # ----------------------------------------------------------- capabilities
 
     def capabilities(self) -> Dict[Capability, CapabilityState]:
-        has_temp = (self._ready and is_elevated()) or (read_ipc_temperature() is not None)
-        temp_state = OK if has_temp else unavailable(self._reason)
+        # A temperature is only "available" once a real reading has arrived.
+        # LibreHardwareMonitor happily enumerates the CPU and publishes a
+        # "Core (Tctl/Tdie)" sensor that reads 0.0 forever when its kernel driver
+        # never loaded, so trusting "the library opened" reported OK next to an
+        # N/A on screen.
+        live = self._saw_temp or read_ipc_temperature() is not None
+        temp_state = OK if live else unavailable(self._reason)
         power_state = OK if (self._ready or self._energy_meter._ready) else unavailable(self._reason)
         self._states = {Capability.CPU_TEMPERATURE: temp_state,
                         Capability.CPU_POWER: power_state}
         return self._states
 
     def status_line(self) -> str:
-        if self._ready and is_elevated():
+        if self._saw_temp:
             return "active (LibreHardwareMonitor)"
         if read_ipc_temperature() is not None:
             return "active (LibreHardwareMonitor via elevated background worker)"
         if self._energy_meter._ready:
-            if not is_elevated():
-                return "active (Windows Energy Meter power; elevate for CPU temperature)"
             return "active (Windows Energy Meter power)"
         return self._reason
 
@@ -452,9 +561,30 @@ class ThermalPowerSource:
 
         self._computer = computer
         self._ready = True
+        self._asm = System.Reflection.Assembly.LoadFrom(dll)
         self._reason = "active (LibreHardwareMonitor)"
-        self._states = {Capability.CPU_TEMPERATURE: OK if is_elevated() else unavailable("run as administrator for temperature"),
-                        Capability.CPU_POWER: OK}
+
+        # Opening the library is not proof that temperature works: it enumerates
+        # the CPU either way.  If the kernel driver failed to install, every
+        # MSR read returns 0.0 and the sensor would read 0C forever, so check the
+        # driver now and name the real blocker instead of guessing later.
+        if not is_elevated():
+            self._reason = "active (LibreHardwareMonitor); elevate for CPU temperature"
+        else:
+            try:
+                ring_t = self._asm.GetType("LibreHardwareMonitor.Hardware.Ring0")
+                if ring_t is not None:
+                    bf = System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Public
+                    is_open_p = ring_t.GetProperty("IsOpen")
+                    if is_open_p and not bool(is_open_p.GetValue(None, None)):
+                        open_m = ring_t.GetMethod("Open", bf)
+                        if open_m:
+                            open_m.Invoke(None, None)
+            except Exception:
+                pass
+            blocked = _driver_block_reason(self._asm)
+            if blocked:
+                self._reason = blocked
 
     # CLR exception types that all mean "the assembly could not be resolved".
     _LOAD_FAILURES = frozenset({
@@ -528,9 +658,10 @@ class ThermalPowerSource:
 
                         if stype == "Temperature":
                             if 0.0 < val < 150.0:
-                                if any(k in sname for k in ("Tctl", "Package", "Total", "Average", "Core Max")):
+                                sname_lower = sname.lower()
+                                if any(k in sname_lower for k in ("tctl", "tdie", "package", "core max", "cpu")):
                                     temp = val
-                                elif temp is None:
+                                elif temp is None and not any(k in sname_lower for k in ("motherboard", "system", "vrm", "aux", "pcie")):
                                     temp = val
                         elif stype == "Power":
                             if 0.0 < val < 1000.0:
@@ -565,8 +696,14 @@ class ThermalPowerSource:
             if ipc_temp is not None:
                 temp = ipc_temp
 
+        if temp is None:
+            wmi_temp = _read_wmi_temperature()
+            if wmi_temp is not None:
+                temp = wmi_temp
+
         if temp is not None:
             self._last_temp = temp
+            self._saw_temp = True
         if power is not None:
             self._last_power = power
         if freq is not None:

@@ -482,6 +482,39 @@ else:
         finally:
             ov.close()
 
+    def test_gui_cpu_temp_explains_a_blocked_driver():
+        """A bare "N/A" sends people hunting for the wrong cause.
+
+        When Defender quarantines LibreHardwareMonitor's WinRing0 driver, the
+        tooltip has to name that rather than repeat "no sensor".
+        """
+        application = app()
+        from sysmon.gui.main_window import MainWindow
+        from sysmon.models import CpuSnapshot, Snapshot
+
+        win = MainWindow(interval=1.0)
+        try:
+            win._on_notes([
+                "librehardwaremonitor: cpu.temperature unavailable - blocked by "
+                "Defender (VulnerableDriver:WinNT/Winring0); LibreHardwareMonitor's "
+                "kernel driver cannot load, so no CPU temperature is available",
+            ])
+            win._render_cpu(Snapshot(cpu=CpuSnapshot(usage=10.0)))
+            application.processEvents()
+
+            tip = win.cpu_temp.toolTip()
+            assert "Defender" in tip, tip
+            assert "WinRing0" in tip, tip
+            assert win.cpu_temp._text == "N/A", win.cpu_temp._text
+
+            # With no note available it must still say something honest.
+            win._notes = []
+            win._render_cpu(Snapshot(cpu=CpuSnapshot(usage=10.0)))
+            assert win.cpu_temp.toolTip(), "tooltip must never be empty"
+            return "CPU temp N/A explains the real blocker"
+        finally:
+            win.close()
+
     def test_gui_overlay_toggle():
         application = app()
         from sysmon.gui.main_window import MainWindow

@@ -66,19 +66,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._elevating = False
 
         self.overlay = OverlayWindow(parent=None)
-        self._hotkey_id = 101
-        self._hotkey_registered = False
-        if sys.platform == "win32":
-            try:
-                import ctypes
-                user32 = ctypes.windll.user32
-                MOD_NOREPEAT = 0x4000
-                VK_F11 = 0x7A
-                hwnd = int(self.winId())
-                if user32.RegisterHotKey(hwnd, self._hotkey_id, MOD_NOREPEAT, VK_F11):
-                    self._hotkey_registered = True
-            except Exception:
-                pass
 
         self._init_tray()
 
@@ -128,7 +115,7 @@ class MainWindow(QtWidgets.QMainWindow):
         show_act = tray_menu.addAction("Show Window")
         show_act.triggered.connect(self._show_from_tray)
 
-        overlay_act = tray_menu.addAction("🎮 Toggle FPS Overlay (F11)")
+        overlay_act = tray_menu.addAction("🎮 Toggle FPS Overlay")
         overlay_act.triggered.connect(lambda: self.overlay_btn.toggle())
 
         clean_act = tray_menu.addAction("Clean Standby Cache")
@@ -265,7 +252,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.overlay_btn = QtWidgets.QPushButton("🎮 Overlay")
         self.overlay_btn.setCheckable(True)
-        self.overlay_btn.setToolTip("Toggle in-game FPS & Hardware Overlay (Hotkey: F11)\nRight-click for Position and Mode settings")
+        self.overlay_btn.setToolTip("Toggle in-game FPS & Hardware Overlay\nRight-click for Position and Mode settings")
         self.overlay_btn.setCursor(QtCore.Qt.PointingHandCursor)
         self.overlay_btn.setFixedHeight(27)
         self.overlay_btn.setStyleSheet(self._button_qss())
@@ -470,7 +457,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._status_until = 0.0
         self._status_override = ""
         bar.addWidget(self.status, 1)
-        hint = QtWidgets.QLabel("Space pause  \u00b7  F11 overlay  \u00b7  C clean RAM  \u00b7  R refresh  \u00b7  Esc quit")
+        hint = QtWidgets.QLabel("Space pause  \u00b7  C clean RAM  \u00b7  R refresh  \u00b7  Esc quit")
         hint.setFont(T.font(10.0))
         hint.setStyleSheet(f"color: {T.FG_DIM};")
         bar.addWidget(hint)
@@ -533,8 +520,6 @@ class MainWindow(QtWidgets.QMainWindow):
             self.close()
         elif key == QtCore.Qt.Key.Key_Space:
             self.pause_btn.toggle()
-        elif key == QtCore.Qt.Key.Key_F11:
-            self.overlay_btn.toggle()
         elif key == QtCore.Qt.Key.Key_C:
             self._on_clean_ram()
         elif key == QtCore.Qt.Key.Key_R:
@@ -545,25 +530,12 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             super().keyPressEvent(event)
 
-    def nativeEvent(self, eventType, message):  # noqa: N802
-        if sys.platform == "win32" and getattr(self, "_hotkey_registered", False):
-            try:
-                import ctypes.wintypes as w
-                msg = w.MSG.from_address(int(message))
-                WM_HOTKEY = 0x0312
-                if msg.message == WM_HOTKEY and msg.wParam == getattr(self, "_hotkey_id", 101):
-                    if hasattr(self, "overlay_btn"):
-                        self.overlay_btn.toggle()
-            except Exception:
-                pass
-        return super().nativeEvent(eventType, message)
-
     def _on_overlay_toggle(self, checked: bool) -> None:
         if checked:
             if self._last:
                 self.overlay.update_snapshot(self._last)
             self.overlay.show()
-            self._flash_status("🎮 In-game FPS overlay active (Press F11 to toggle)")
+            self._flash_status("🎮 In-game FPS overlay active")
         else:
             self.overlay.hide()
             self._flash_status("🎮 In-game FPS overlay hidden")
@@ -617,7 +589,7 @@ class MainWindow(QtWidgets.QMainWindow):
         ct_act.triggered.connect(lambda checked: self.overlay.set_click_through(checked))
 
         menu.addSeparator()
-        toggle_act = menu.addAction("Toggle Overlay (F11)")
+        toggle_act = menu.addAction("Toggle Overlay")
         toggle_act.triggered.connect(lambda: self.overlay_btn.toggle())
 
         menu.exec(self.overlay_btn.mapToGlobal(pos))
@@ -737,12 +709,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._anim.stop()
         self._clock.stop()
         self.sampler.stop()
-        if getattr(self, "_hotkey_registered", False):
-            try:
-                import ctypes
-                ctypes.windll.user32.UnregisterHotKey(int(self.winId()), self._hotkey_id)
-            except Exception:
-                pass
         if hasattr(self, "overlay") and self.overlay:
             self.overlay.close()
         if hasattr(self, "tray_icon") and self.tray_icon:
@@ -829,14 +795,10 @@ class MainWindow(QtWidgets.QMainWindow):
                     font-weight: 600;
                 }}
                 """)
-        elif not is_admin() and read_ipc_temperature() is None:
-            self.cpu_temp.set_value("N/A (no sensor)", T.qcolor(T.ACCENT),
-                                    "No CPU temperature sensor is available.\n"
-                                    "Run elevated with 'sysmon sensors install' to add "
-                                    "the LibreHardwareMonitor provider.")
         else:
-            self.cpu_temp.set_value("N/A", T.qcolor(T.FG_DIM),
-                                    "No CPU temperature sensor reported by hardware monitor")
+            # Name the real blocker. "N/A" alone left people re-running as admin
+            # forever when the actual cause was Defender blocking the driver.
+            self.cpu_temp.set_value("N/A", T.qcolor(T.FG_DIM), self._temp_unavailable_tip())
 
         if cpu.has_power:
             self.cpu_power.set_value(human_watt(cpu.power_w), T.qcolor(T.FG),
@@ -844,6 +806,31 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             self.cpu_power.set_value("N/A", T.qcolor(T.FG_DIM),
                                     "No CPU power sensor available")
+
+    def _temp_unavailable_tip(self) -> str:
+        """Why there is no CPU temperature, taken from the provider itself.
+
+        Read from the capability notes the sampler already publishes rather than
+        from the live provider, so it survives the sampler thread restarting and
+        stays correct after the window has been open for hours.
+        """
+        reason = ""
+        for note in self._notes:
+            if "cpu.temperature" in note and "unavailable" in note:
+                reason = note.split("unavailable - ", 1)[-1]
+                break
+        if not reason:
+            reason = "no CPU temperature sensor reported"
+        if "Defender" in reason or "WinRing0" in reason or "kernel driver" in reason:
+            return (
+                "LibreHardwareMonitor needs the WinRing0 kernel driver for MSR "
+                "readings, and Defender quarantines it as a vulnerable driver.\n\n"
+                f"{reason}\n\n"
+                "To enable it, allow that driver in Windows Security, or exclude "
+                "the sysmon folder from real-time protection. Until then this "
+                "field stays N/A - it cannot be read any other way."
+            )
+        return reason
 
     def _render_stat(self, row_widget: StatRow, value, formatter, tip: str) -> None:
         """Set a StatRow from a raw value, or an honest ``N/A`` with a reason."""

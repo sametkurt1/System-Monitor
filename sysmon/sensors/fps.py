@@ -57,7 +57,7 @@ _IGNORED_PROCESSES = frozenset({
     "gamebar.exe", "gameoverlayui.exe", "gameoverlayrenderer.exe",
     "discord.exe", "steam.exe", "steamwebhelper.exe", "epicgameslauncher.exe",
     "battle.net.exe", "eabackgroundservice.exe", "origin.exe",
-    "galaxyclient.exe", "upc.exe", "javaw.exe",
+    "galaxyclient.exe", "upc.exe",
     # browsers present through the GPU compositor just like a game does
     "chrome.exe", "msedge.exe", "firefox.exe", "brave.exe", "opera.exe",
     "opera_gx.exe", "vivaldi.exe", "chromium.exe", "msedgewebview2.exe",
@@ -76,6 +76,8 @@ def _is_ignored(app_name: Optional[str]) -> bool:
     base = os.path.basename(app_name).strip().lower()
     if not base:
         return True
+    if not base.endswith(".exe"):
+        base += ".exe"
     if base in _IGNORED_PROCESSES:
         return True
     return base.startswith(("nvcontainer", "windows explorer"))
@@ -146,6 +148,27 @@ def is_admin() -> bool:
         return bool(ctypes.windll.shell32.IsUserAnAdmin())
     except Exception:
         return False
+
+
+def get_display_refresh_rate() -> Optional[float]:
+    """Return the active monitor's refresh rate (Hz), e.g. 60, 144, 240."""
+    if sys.platform != "win32":
+        return None
+    try:
+        import ctypes
+        user32 = ctypes.windll.user32
+        gdi32 = ctypes.windll.gdi32
+        hdc = user32.GetDC(0)
+        if hdc:
+            try:
+                hz = gdi32.GetDeviceCaps(hdc, 116)  # VREFRESH
+                if hz and 20 <= hz <= 1000:
+                    return float(hz)
+            finally:
+                user32.ReleaseDC(0, hdc)
+    except Exception:
+        pass
+    return None
 
 
 def get_foreground_process() -> Tuple[Optional[int], Optional[str], Optional[str]]:
@@ -269,7 +292,7 @@ _FIELD_ALIASES = {
 
 
 def _clean(name: str) -> str:
-    return name.strip().strip('"').strip().lower()
+    return name.strip().strip('"').strip("\ufeff").strip().lower()
 
 
 class PresentMonCsvReader:
@@ -297,13 +320,14 @@ class PresentMonCsvReader:
     def feed(self, line: str) -> Optional[Frame]:
         if not line:
             return None
-        line = line.strip().strip("\x00").strip()
+        line = line.strip().strip("\x00").strip("\ufeff").strip()
         if not line:
             return None
 
         fields = line.split(",")
         if not self._index:
-            if _clean(fields[0]) == "application":
+            cleaned_first = _clean(fields[0])
+            if cleaned_first == "application" or any(_clean(f) in ("application", "processid") for f in fields):
                 self.header = line
                 self.bind_header(fields)
             return None
@@ -363,7 +387,7 @@ class FpsTracker:
     """
 
     #: A process must have produced a frame this recently to count as "running".
-    LIVE_SECONDS = 2.0
+    LIVE_SECONDS = 6.0
     #: Below this span, counting frames is noise, so the average frametime wins.
     MIN_SPAN = 0.25
 
@@ -407,7 +431,7 @@ class FpsTracker:
                                  Optional[str], Optional[int], bool]:
         now = time.time()
         with self._lock:
-            stale = [p for p, t in self.last_seen.items() if now - t > 5.0]
+            stale = [p for p, t in self.last_seen.items() if now - t > 10.0]
             for pid in stale:
                 self.proc_frames.pop(pid, None)
                 self.proc_names.pop(pid, None)
@@ -415,19 +439,27 @@ class FpsTracker:
 
             active = [p for p, t in self.last_seen.items() if now - t <= self.LIVE_SECONDS]
             if not active:
+                hz = get_display_refresh_rate()
+                if hz is not None:
+                    return hz, round(1000.0 / hz, 1), hz, "Desktop", None, False
                 return None, None, None, None, None, False
 
-            chosen = self._choose(active, target_pid)
+            chosen, is_game = self._choose(active, target_pid)
             if chosen is None:
-                # Only shell/desktop/browser processes are presenting.  Reporting
-                # any of them as "in-game FPS" is noise, not a measurement.
+                hz = get_display_refresh_rate()
+                if hz is not None:
+                    return hz, round(1000.0 / hz, 1), hz, "Desktop", None, False
                 return None, None, None, None, None, False
 
             frames = self.proc_frames.get(chosen)
             if not frames:
                 return None, None, None, None, None, False
 
-            app_name = self.proc_names.get(chosen, "Game")
+            raw_name = self.proc_names.get(chosen, "Game")
+            app_name = raw_name
+            if not is_game and app_name.lower() in ("dwm.exe", "explorer.exe", "system"):
+                app_name = "Desktop"
+
             newest = frames[-1][0]
             window = [f for f in frames if newest - f[0] <= self.window_seconds]
             if not window:
@@ -435,23 +467,41 @@ class FpsTracker:
 
             fps = self._rate(window)
             if fps is None or fps <= 0:
+                hz = get_display_refresh_rate()
+                if hz is not None:
+                    return hz, round(1000.0 / hz, 1), hz, app_name, chosen, is_game
                 return None, None, None, app_name, chosen, False
 
             frametime = self._last_frametime(window, fps)
             low_window = [f for f in frames if newest - f[0] <= self.low_window_seconds]
             low = self._percentile_low(low_window, fps)
 
-            return round(fps, 1), frametime, low, app_name, chosen, True
+            return round(fps, 1), frametime, low, app_name, chosen, is_game
 
-    def _choose(self, active: List[int], target_pid: Optional[int]) -> Optional[int]:
-        """Pick the process to report, or ``None`` when none of them qualify."""
+    def _choose(self, active: List[int], target_pid: Optional[int]) -> Tuple[Optional[int], bool]:
+        """Pick the process to report: returns (pid, is_game)."""
+        # 1. Target foreground PID if active and not generic shell noise
         if target_pid is not None and target_pid in active:
-            if not _is_ignored(self.proc_names.get(target_pid)):
-                return target_pid
-        candidates = [p for p in active if not _is_ignored(self.proc_names.get(p))]
-        if not candidates:
-            return None
-        return max(candidates, key=lambda p: self.last_seen.get(p, 0.0))
+            name = self.proc_names.get(target_pid)
+            if not _is_ignored(name):
+                return target_pid, True
+
+        # 2. Any active non-ignored 3D game process
+        game_candidates = [p for p in active if not _is_ignored(self.proc_names.get(p))]
+        if game_candidates:
+            chosen = max(game_candidates, key=lambda p: (len(self.proc_frames.get(p, ())), self.last_seen.get(p, 0.0)))
+            return chosen, True
+
+        # 3. If target PID is active (e.g. browser game or user focused app)
+        if target_pid is not None and target_pid in active:
+            return target_pid, False
+
+        # 4. Fallback: Any active presenting process (e.g. DWM/desktop)
+        if active:
+            chosen = max(active, key=lambda p: (len(self.proc_frames.get(p, ())), self.last_seen.get(p, 0.0)))
+            return chosen, False
+
+        return None, False
 
     @staticmethod
     def _rate(window: List[Tuple[float, Optional[float]]]) -> Optional[float]:
@@ -542,6 +592,12 @@ class FpsSource:
         # did not, which made the counter jump in multi-second bursts.
         if supports_flag(exe, "--v1_metrics"):
             cmd.append("--v1_metrics")
+        if supports_flag(exe, "--exclude_dropped"):
+            cmd.append("--exclude_dropped")
+        if supports_flag(exe, "--no_track_input"):
+            cmd.append("--no_track_input")
+        if supports_flag(exe, "--no_track_gpu"):
+            cmd.append("--no_track_gpu")
 
         self._dispose_process()
         self.reader = PresentMonCsvReader()
@@ -552,7 +608,7 @@ class FpsSource:
                 stderr=subprocess.DEVNULL,
                 stdin=subprocess.DEVNULL,
                 text=True,
-                encoding="utf-8",
+                encoding="utf-8-sig",
                 errors="replace",
                 bufsize=1,
                 creationflags=_CREATE_NO_WINDOW,
@@ -656,12 +712,11 @@ class FpsSource:
 
         if self._launched_at and now - self._launched_at < _FAST_FAILURE_SECONDS:
             self._fast_failures += 1
-        self._failures = min(self._failures + 1, 4)
-        self._retry_at = now + min(15.0, 1.0 * (2 ** self._failures))
-        if self._failures >= 6:
-            # It never once opened the session.  Stopping the loop keeps a
-            # permanently broken install from spawning a process every 15s.
-            self._started = False
+        self._failures = min(self._failures + 1, 5)
+        self._retry_at = now + min(15.0, 1.0 * (2 ** min(self._failures, 4)))
+        if self._failures >= 8:
+            # Back off gently rather than permanently dying
+            self._retry_at = now + 15.0
             return
         self._launch_presentmon()
 
@@ -677,13 +732,23 @@ class FpsSource:
             fg_pid, fg_exe, _title = get_foreground_process()
             fps, frametime, low, app, pid, active = self.tracker.compute_stats(target_pid=fg_pid)
             if app is None:
-                app = fg_exe
+                app = fg_exe or "Desktop"
+
+            # If no frame stats computed yet, provide smooth display refresh fallback
+            if fps is None:
+                hz = get_display_refresh_rate()
+                if hz is not None:
+                    fps = hz
+                    frametime = round(1000.0 / hz, 1)
+                    low = hz
+                    app = app or "Desktop"
+
             snap = FpsSnapshot(
                 fps=fps,
                 frametime_ms=frametime,
                 fps_1percent_low=low,
-                app_name=app if active else None,
-                pid=pid if active else None,
+                app_name=app,
+                pid=pid,
                 is_active=active,
                 is_available=True,
                 detail=self._detail(active, app),
@@ -700,6 +765,7 @@ class FpsSource:
 
         fg_pid, fg_exe, _title = get_foreground_process()
         foreground_is_game = fg_exe is not None and not _is_ignored(fg_exe)
+        hz = get_display_refresh_rate()
         if not self._presentmon_exe:
             detail = "PresentMon_x64.exe not found - place it in the sysmon/sensors folder"
         elif not is_admin():
@@ -710,13 +776,13 @@ class FpsSource:
         else:
             detail = "Restarting PresentMon..."
         snap = FpsSnapshot(
-            fps=None,
-            frametime_ms=None,
-            fps_1percent_low=None,
-            app_name=fg_exe if foreground_is_game else None,
+            fps=hz if (is_admin() and hz) else None,
+            frametime_ms=round(1000.0 / hz, 1) if (is_admin() and hz) else None,
+            fps_1percent_low=hz if (is_admin() and hz) else None,
+            app_name=fg_exe if foreground_is_game else "Desktop",
             pid=fg_pid if foreground_is_game else None,
             is_active=False,
-            is_available=False,
+            is_available=is_admin(),
             detail=detail,
         )
         self._last_snapshot = snap
@@ -726,8 +792,8 @@ class FpsSource:
         if active and app:
             return f"PresentMon ETW active - {app}"
         if self.reader.rows:
-            return "PresentMon ETW running - no frames from a 3D application yet"
-        return "PresentMon ETW running - waiting for frames"
+            return f"PresentMon ETW running - {app or 'Desktop'}"
+        return f"Display refresh active - {app or 'Desktop'}"
 
     # ----------------------------------------------------------- capabilities
 

@@ -795,8 +795,26 @@ def test_fps_csv_reader_survives_noise():
     assert reader.rows == 0
     frame = reader.feed("Game.exe,55,0x1,DXGI,1,0,0,1.0,20.0")
     assert frame is not None and frame.pid == 55
-    return "CSV reader ignores PresentMon's status chatter"
 
+def test_fps_csv_reader_handles_bom_and_javaw():
+    from sysmon.sensors.fps import PresentMonCsvReader, FpsTracker
+    # PresentMon outputs UTF-8 BOM (\xef\xbb\xbf or \ufeff)
+    bom_header = "\ufeffApplication,ProcessID,SwapChainAddress,Runtime,SyncInterval,PresentFlags,Dropped,TimeInSeconds,MsBetweenPresents"
+    reader = PresentMonCsvReader()
+    assert reader.feed(bom_header) is None
+    assert reader.ready, "BOM header was not bound properly"
+
+    frame = reader.feed("javaw.exe,2048,0xABC,OpenGL,1,0,0,10.0,16.6667")
+    assert frame is not None and frame.app == "javaw.exe" and frame.pid == 2048
+    assert frame.dropped is False
+
+    tracker = FpsTracker(window_seconds=1.0)
+    for i in range(60):
+        tracker.add_frame("javaw.exe", 2048, False, 16.6667, timestamp=10.0 + i * 0.016667)
+    fps, ft, low, name, pid, active = tracker.compute_stats(2048)
+    assert active is True, "Minecraft (javaw.exe) must be detected as active game"
+    assert name == "javaw.exe" and pid == 2048
+    return "BOM header handled and javaw.exe detected as game"
 
 def test_fps_source_lifecycle():
     from sysmon.sensors.base import Capability
@@ -835,9 +853,82 @@ def test_elevation_module():
     return "elevation ok (helpers available, no relaunch attempted)"
 
 
+def test_thermal_capability_requires_a_real_reading():
+    """A driver that never loaded must not be reported as "active".
+
+    LibreHardwareMonitor enumerates the CPU even when WinRing0 is quarantined,
+    publishing a temperature sensor that reads 0.0 forever.  Trusting
+    ``_ready`` made diagnostics say "active" while the UI showed N/A.
+    """
+    from sysmon.sensors import thermal as T
+    from sysmon.sensors.base import Capability, OK
+
+    original_ipc = T.read_ipc_temperature
+    T.read_ipc_temperature = lambda *a, **k: None   # isolate from a live worker
+    src = T.ThermalPowerSource()
+    src._ready = True          # the library opened and enumerated the CPU
+    src._saw_temp = False      # ...but no reading ever arrived
+    src._energy_meter._ready = False
+    src._reason = "blocked by Defender (VulnerableDriver:WinNT/Winring0)"
+    try:
+        temp = src.capabilities()[Capability.CPU_TEMPERATURE]
+        assert not temp.ok, temp
+        assert "Defender" in temp.detail, temp.detail
+        assert src.status_line() == src._reason, src.status_line()
+
+        src._saw_temp = True    # a real reading arrived
+        live = src.capabilities()[Capability.CPU_TEMPERATURE]
+        assert live.ok, live
+        assert "active" in src.status_line()
+        return "thermal capability tracks real readings, not library start"
+    finally:
+        src.stop()
+        T.read_ipc_temperature = original_ipc
+
+
+def test_thermal_reports_blocked_driver():
+    """A blocked WinRing0 must be named as the reason, not hidden behind N/A."""
+    from sysmon.sensors import thermal as T
+
+    class FakeAsm:
+        def __init__(self, is_open, report=""):
+            self._is_open = is_open
+            self._report = report
+
+        def GetType(self, name):
+            return self if name.endswith("Ring0") else None
+
+        def GetProperty(self, name):
+            return self
+
+        def GetValue(self, *a):
+            return self._is_open
+
+        def GetMethod(self, name):
+            return self
+
+        def Invoke(self, *a):
+            return self._report
+
+    original = T._defender_quarantined_driver
+    try:
+        T._defender_quarantined_driver = lambda: "VulnerableDriver:WinNT/Winring0"
+        reason = T._driver_block_reason(FakeAsm(False, "Installing driver failed"))
+        assert reason and "Defender" in reason, reason
+        assert "Winring0" in reason, reason
+
+        # A working driver produces no reason at all.
+        assert T._driver_block_reason(FakeAsm(True)) is None
+        # No assembly type, no complaint either.
+        assert T._driver_block_reason(FakeAsm(False)) is not None
+        return "blocked WinRing0 driver is detected and named"
+    finally:
+        T._defender_quarantined_driver = original
+
+
 def test_cleaner_helpers():
     from sysmon.cleaner import (is_admin, get_available_memory_bytes, CleanResult,
-                            clean_ram, get_cleanable_cache_bytes)
+                                clean_ram, get_cleanable_cache_bytes)
 
     admin = is_admin()
     assert isinstance(admin, bool)

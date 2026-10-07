@@ -104,6 +104,10 @@ def _pythonw_path() -> Optional[str]:
 
 def _script_path() -> str:
     """Absolute path of the entry script, even when launched via a shortcut."""
+    repo_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    root_script = os.path.join(repo_dir, "sysmon.py")
+    if os.path.isfile(root_script):
+        return root_script
     try:
         return os.path.abspath(sys.argv[0] or __file__)
     except Exception:
@@ -117,17 +121,17 @@ def _elevated_target(argv: Sequence[str]) -> Tuple[str, str]:
     console window behind either.
     """
     if getattr(sys, "frozen", False):
-        return sys.executable, subprocess.list2cmdline(list(argv[1:]))
+        return sys.executable, subprocess.list2cmdline(list(argv))
 
     exe = _pythonw_path() or sys.executable
-    return exe, subprocess.list2cmdline([_script_path(), *argv[1:]])
+    return exe, subprocess.list2cmdline([_script_path(), *argv])
 
 
 def relaunch_elevated(argv: Sequence[str]) -> Tuple[bool, int]:
     """Ask UAC for elevation and start a privileged copy of this program."""
     exe, params = _elevated_target(argv)
     directory = os.path.dirname(os.path.abspath(exe)) or os.getcwd()
-    return _shell_execute("runas", exe, params, directory, _SW_SHOWNORMAL)
+    return _shell_execute("runas", exe, params, directory, _SW_SHNORMAL if hasattr(sys, '_SW_SHNORMAL') else _SW_SHOWNORMAL)
 
 
 def _relaunch_windowless(argv: Sequence[str]) -> bool:
@@ -135,10 +139,10 @@ def _relaunch_windowless(argv: Sequence[str]) -> bool:
     pythonw = _pythonw_path()
     if not pythonw:
         return False
-    params = subprocess.list2cmdline([_script_path(), *argv[1:]])
+    params = subprocess.list2cmdline([_script_path(), *argv])
     try:
         subprocess.Popen(
-            [pythonw, _script_path(), *argv[1:]],
+            [pythonw, _script_path(), *argv],
             creationflags=_DETACHED_PROCESS | _CREATE_NO_WINDOW,
             close_fds=True,
         )

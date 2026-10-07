@@ -20,9 +20,18 @@ from . import theme as T
 
 # Win32 Constants
 GWL_EXSTYLE = -20
+WS_EX_TOPMOST = 0x00000008
 WS_EX_TRANSPARENT = 0x00000020
+WS_EX_TOOLWINDOW = 0x00000080
 WS_EX_LAYERED = 0x00080000
 WS_EX_NOACTIVATE = 0x08000000
+
+HWND_TOPMOST = -1
+SWP_NOSIZE = 0x0001
+SWP_NOMOVE = 0x0002
+SWP_NOACTIVATE = 0x0010
+SWP_FRAMECHANGED = 0x0020
+SWP_SHOWWINDOW = 0x0040
 
 
 class OverlayWindow(QtWidgets.QWidget):
@@ -58,6 +67,12 @@ class OverlayWindow(QtWidgets.QWidget):
         self._last_snapshot = Snapshot()
         self._build_ui()
         self.apply_position()
+
+        # Periodically enforce HWND_TOPMOST so fullscreen exclusive & borderless games cannot obscure the HUD
+        self._topmost_timer = QtCore.QTimer(self)
+        self._topmost_timer.setInterval(400)
+        self._topmost_timer.timeout.connect(self._reinforce_topmost)
+        self._topmost_timer.start()
 
     def _build_ui(self) -> None:
         root = QtWidgets.QVBoxLayout(self)
@@ -190,6 +205,19 @@ class OverlayWindow(QtWidgets.QWidget):
         self._click_through = enabled
         self.apply_click_through()
 
+    def _reinforce_topmost(self) -> None:
+        """Keep overlay permanently pinned above fullscreen/borderless games and DWM."""
+        if sys.platform != "win32" or not self.isVisible():
+            return
+        try:
+            hwnd = int(self.winId())
+            ctypes.windll.user32.SetWindowPos(
+                hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW
+            )
+        except Exception:
+            pass
+
     def apply_click_through(self) -> None:
         if sys.platform != "win32":
             return
@@ -197,10 +225,16 @@ class OverlayWindow(QtWidgets.QWidget):
             hwnd = int(self.winId())
             user32 = ctypes.windll.user32
             ex_style = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+            base_style = ex_style | WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW
             if self._click_through:
-                user32.SetWindowLongW(hwnd, GWL_EXSTYLE, ex_style | WS_EX_TRANSPARENT | WS_EX_LAYERED | WS_EX_NOACTIVATE)
+                new_style = base_style | WS_EX_TRANSPARENT
             else:
-                user32.SetWindowLongW(hwnd, GWL_EXSTYLE, (ex_style & ~WS_EX_TRANSPARENT) | WS_EX_LAYERED | WS_EX_NOACTIVATE)
+                new_style = base_style & ~WS_EX_TRANSPARENT
+            user32.SetWindowLongW(hwnd, GWL_EXSTYLE, new_style)
+            user32.SetWindowPos(
+                hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_FRAMECHANGED
+            )
         except Exception:
             pass
 
@@ -262,6 +296,7 @@ class OverlayWindow(QtWidgets.QWidget):
     def update_snapshot(self, snap: Snapshot) -> None:
         """Update live overlay metrics from the latest system snapshot."""
         self._last_snapshot = snap
+        self._reinforce_topmost()
         fps_info = snap.fps
 
         # 1. Update Game Name / Status
@@ -270,9 +305,15 @@ class OverlayWindow(QtWidgets.QWidget):
             if clean_name.lower().endswith(".exe"):
                 clean_name = clean_name[:-4]
             self.game_lbl.setText(clean_name[:24])
-            self.status_dot.setStyleSheet("color: #34d399;")  # Active green
+            if getattr(fps_info, "is_active", False):
+                self.icon_lbl.setText("🎮")
+                self.status_dot.setStyleSheet("color: #34d399;")  # Active game green
+            else:
+                self.icon_lbl.setText("🖥️")
+                self.status_dot.setStyleSheet("color: #38bdf8;")  # Active desktop/compositor cyan
         else:
             self.game_lbl.setText("sysmon OSD")
+            self.icon_lbl.setText("🎮")
             self.status_dot.setStyleSheet("color: #64748b;")  # Standby grey
 
         # 2. Update FPS & Frametime
@@ -299,12 +340,9 @@ class OverlayWindow(QtWidgets.QWidget):
             self.frametime_val.setText("needs Admin")
             self.low1_val.setText("🛡️ Elevate sysmon")
         else:
-            # Capture is healthy, there is simply nothing presenting right now:
-            # a desktop, a browser tab, or simply not a game.  Say so instead of
-            # looking broken.
             self.fps_val.setText("--")
             self.fps_val.setStyleSheet("color: #64748b;")
-            self.frametime_val.setText("waiting for a game")
+            self.frametime_val.setText(fps_info.detail if (fps_info and fps_info.detail) else "waiting for a game")
             self.low1_val.setText("1% Low: --")
 
         # 3. Update GPU Stats
@@ -329,3 +367,8 @@ class OverlayWindow(QtWidgets.QWidget):
         m_used = human_gb(m.used_bytes, 1) if m.used_bytes else "-- GB"
         m_total = human_gb(m.total_bytes, 0) if m.total_bytes else "-- GB"
         self.ram_txt.setText(f"{m_used} / {m_total} ({m.usage:.0f}%)" if m.usage is not None else f"{m_used} / {m_total}")
+
+    def closeEvent(self, event) -> None:  # noqa: N802
+        if hasattr(self, "_topmost_timer") and self._topmost_timer:
+            self._topmost_timer.stop()
+        super().closeEvent(event)
